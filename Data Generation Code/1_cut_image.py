@@ -8,11 +8,12 @@ import open3d
 import numpy as np
 from scripts.circle import rectangle_circumcircle, is_in_range, check_list
 import math
-# 切割代码 
+# 切割代码
 
-test_save_path = "/home/zrx/lab_disk1/zhourixin/oracle/make+fragment_zhouProcess/make_fragmentV4/test_image"
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+test_save_path = os.path.join(ROOT_DIR, 'data', 'test_image')
 if os.path.exists(test_save_path) is False:
-    os.mkdir(test_save_path)
+    os.makedirs(test_save_path, exist_ok=True)
 
 class Fragment(object):
     def __init__(self, img, pcd, transformation, flag, area):
@@ -1287,7 +1288,7 @@ def random_segmentation_circle(imgs):
 if __name__ == '__main__':
     print('正在处理数据目录')
 
-    root = '/home/zrx/lab_disk1/zhourixin/oracle/DATASET/image+all+in+one/image all in one'  # 所有包含一张图片的文件夹的路径
+    root = '../DATASET'  # 所有包含一张图片的文件夹的路径
     # root = '/home/zrx/lab_disk1/zhourixin/oracle/make+fragment/make fragment/my dataset/all/car'
 
     # segment_logic = "origin"
@@ -1296,13 +1297,15 @@ if __name__ == '__main__':
     segment_logic = "circle_sample_V5_2"# V5_1基础上，限制切割点必须在轮廓范围内
     print(f"cut mode:{segment_logic}")
 
-
-
-
     if segment_logic == "circle_sample_V5_2":
-        save_root = "/home/zrx/lab_disk1/zhourixin/oracle/DATASET/image+all+in+one/image all in one "+segment_logic + "/fragments"
-        process_root = "/home/zrx/lab_disk1/zhourixin/oracle/DATASET/image+all+in+one/image all in one "+segment_logic + "/process"
-        areaJPG_root = "/home/zrx/lab_disk1/zhourixin/oracle/DATASET/image+all+in+one/image all in one "+segment_logic
+        save_root = os.path.join(ROOT_DIR, 'data', segment_logic, 'fragments')
+        process_root = os.path.join(ROOT_DIR, 'data', segment_logic, 'process')
+        areaJPG_root = os.path.join(ROOT_DIR, 'data', segment_logic)
+        # 自动创建目录
+        os.makedirs(save_root, exist_ok=True)
+        os.makedirs(process_root, exist_ok=True)
+        os.makedirs(areaJPG_root, exist_ok=True)
+        # 读取图片列表
         img_list = os.listdir(root)
         area_list=np.array([])
 
@@ -1317,16 +1320,18 @@ if __name__ == '__main__':
             idx = 0
             '''读取原图'''
             img_path = os.path.join(root, img_list[m])
-            img1 = cv2.imread(os.path.join(img_path, 'image.jpg'), cv2.IMREAD_UNCHANGED)
-
+            img1 = cv2.imread(img_path, cv2.IMREAD_UNCHANGED) 
+            if img1 is None:
+                print(f"无法读取图片: {img_path}")
+                continue
             this_image_area_list = []
             this_image_area = img1.size / 3
 
-            saved_path = os.path.join(save_root, img_list[m])
-            if os.path.exists(saved_path) is False:
+            saved_path = os.path.join(save_root, os.path.splitext(img_list[m])[0])
+            if not os.path.exists(saved_path):
                 os.makedirs(saved_path)
 
-            cv2.imwrite(os.path.join(saved_path, 'image.jpg'), img1)
+            cv2.imwrite(os.path.join(saved_path, img_list[m]), img1)
 
             fragment_list = []
 

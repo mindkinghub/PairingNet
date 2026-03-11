@@ -8,6 +8,7 @@ from math import fabs
 from scripts import data_preprocess
 from PIL import Image
 count1 = 0
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 # 埃尔米特插值
 """
@@ -88,8 +89,10 @@ def file_filter(f):
     else:
         return False
 
-test_image_path= "./"
+test_image_path= os.path.join(ROOT_DIR, 'data', 'test_image')
 def save_test_image(saved_image, origin_image, image_id, forder_name):
+    folder_path = os.path.join(test_image_path, forder_name)
+    os.makedirs(folder_path, exist_ok=True)
     if forder_name in ["origin_b_image", "dilated_image"] :
         img = Image.fromarray(saved_image.astype('uint8'))
         img.save(test_image_path+'/{}/contour_order_{}.png'.format(forder_name, image_id))
@@ -107,128 +110,94 @@ def down_sample(order_point, stride):
 
     return new_point
 
-def preprocess(path):
-    global count1
-    imglist = os.listdir(path)
-    imglist = list(filter(file_filter, imglist))
-    imglist.sort(key=lambda x: int(x[:-4][9:]))
+def preprocess(img_path, current_nums):
+    global count1, matching_set
+
+    # 过滤出 fragment 文件
+    imglist = [f for f in os.listdir(img_path) if f.startswith('fragment') and f.endswith('.png')]
+
+    # 按编号排序
+    def fragment_sort_key(name):
+        num_str = ''.join(filter(str.isdigit, name))
+        return int(num_str)
+    imglist.sort(key=fragment_sort_key)
+
+    gt_path = os.path.join(img_path, 'gt.txt')
     transforms = np.zeros((0, 9))
-    with open(os.path.join(path, 'gt.txt'), 'r') as gt_file:
-        while True:
-            transform = gt_file.readline()
-            if not transform:
-                break
-            else:
-                transform = string.capwords(transform.strip()).split(' ')
-                if len(transform) == 1:
+    
+    if os.path.exists(gt_path):
+        with open(gt_path, 'r') as gt_file:
+            for transform in gt_file:
+                transform = transform.strip()
+                if len(transform) == 0:
                     continue
-                else:
-                    transform = np.asarray(transform, dtype=np.float)
-                    transforms = np.vstack((transforms, transform[:9]))
+                # 只取数字
+                vals = np.array([float(x) for x in transform.split() if x.replace('.', '', 1).replace('-', '', 1).isdigit()])
+                if len(vals) != 9:
+                    # 跳过不满足长度的行
+                    continue
+                transforms = np.vstack((transforms, vals))
+        transforms = transforms.reshape(-1, 3, 3)
+        transforms = np.linalg.inv(transforms)
+    else:
+        # 如果没有 gt.txt，使用单位矩阵
+        transforms = np.array([np.eye(3) for _ in range(len(imglist))])
 
-    transforms = transforms.reshape(-1, 3, 3)
-    transforms = np.linalg.inv(transforms)
-
-    '''get org images'''
+    '''get original images'''
     img_all = []
     extra_all = []
-    shapes = np.zeros((0, 3), dtype=np.int)
-    for i in range(len(imglist)):
-        if imglist[i][-3:] != 'png':
+    shapes = np.zeros((0, 3), dtype=int)
+    for i, img_name in enumerate(imglist):
+        img = cv2.imread(os.path.join(img_path, img_name), cv2.IMREAD_UNCHANGED)
+        if img is None:
             continue
-        if imglist[i][:8] != 'fragment':
-            continue
-        img = cv2.imread(os.path.join(img_path, imglist[i]), cv2.IMREAD_UNCHANGED)
-        img = img.transpose(1, 0, 2)
+        img = img.transpose(1, 0, 2)  # 原代码
         img_all.append(img)
         shapes = np.vstack((shapes, img.shape))
-        with open(os.path.join(img_path, 'bg.txt'), 'r') as bg_f:
-            bg = bg_f.readline()
-        bg = np.asarray(bg.split(), dtype=np.int)
 
     '''get image contour'''
     full_contour_all = []
     down_sample_contour = []
-    for j in range(len(img_all)):
-        
-        print('fragment {} start'.format(j+1))
-        image = img_all[j]
 
-        image_save = Image.fromarray(image.astype('uint8') )
-        image_save.save(test_image_path+'/origin0/image_{}.png'.format(j))
-
+    for j, image in enumerate(img_all):
+        with open(os.path.join(img_path, 'bg.txt'), 'r') as bg_f:
+            bg = np.array(list(map(int, bg_f.readline().split())), dtype=int)
         mask = (image == bg).all(axis=-1)
-        image[mask] = (0, 0, 0)  # 图片背景设置为0
-        img_all[j] = image.transpose(1, 0, 2)
+        image[mask] = (0, 0, 0)
+        img_all[j] = image
+
         gray = np.ones(image.shape[:2], dtype=np.uint8)
         gray[~mask] = 255
         _, b_image = cv2.threshold(gray, 128, 255, cv2.THRESH_BINARY)
-
-        # save_test_image(b_image, image, j, "origin_b_image")
         contour, hierarchy = cv2.findContours(b_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
 
+        # 取最大轮廓
         if len(contour) > 1:
-            # temp_contour = np.zeros((0, 2))
-            # for c in contour:
-            #     temp_contour = np.vstack((temp_contour, c.reshape(-1, 2)))
-            # contour = temp_contour
-            max_len_contour=-1
-            max_contour=contour[0]
-            count1 += 1
-            for i,c in enumerate(contour):
-                if len(c)>=max_len_contour:
-                    max_contour=contour[i]
-                    max_len_contour=len(c)
-            contour=max_contour.reshape(-1, 2)
-
-
-
+            max_len_contour = -1
+            max_contour = contour[0]
+            for c in contour:
+                if len(c) >= max_len_contour:
+                    max_contour = c
+                    max_len_contour = len(c)
+            contour = max_contour.reshape(-1, 2)
         else:
-            contour = np.asarray(contour, dtype=np.float).reshape(-1, 2)
-        contour_order = contour.copy()
+            contour = np.asarray(contour, dtype=float).reshape(-1, 2)
 
-        stride = 3
-        sigma = 3
-        temp_contour = contour_order.copy()
-        temp_contour = np.expand_dims(temp_contour, axis=1)
-        contour_guss = cv2.GaussianBlur(temp_contour.astype(np.float32), (0, 0), sigma)
-        contour_guss = np.squeeze(contour_guss)
-        contour_guss = contour_guss.astype(int)
-        mask = np.linalg.norm(contour_guss - np.roll(contour_guss, 1, axis=0), axis=-1) == 0
-        contour_guss = contour_guss[~mask]
-        down_sample_guss_point = down_sample(contour_guss, stride)
-
-        '''counterclockwise downsample contour'''
-        contour_order_rstep = np.roll(down_sample_guss_point, 1, axis=0)
-        x_mean_, y_mean_ = down_sample_guss_point[:, 0].mean(), down_sample_guss_point[:, 1].mean()
-        sample_vec = down_sample_guss_point - contour_order_rstep
-        normal = down_sample_guss_point - np.array([x_mean_, y_mean_])
-        if np.cross(sample_vec, normal).mean() > 0:
-            down_sample_guss_point = down_sample_guss_point[::-1]
-        else:
-            pass
-        '''counterclockwise guss contour'''
-        contour_order_rstep = np.roll(contour_guss, 1, axis=0)
-        x_mean_, y_mean_ = contour_guss[:, 0].mean(), contour_guss[:, 1].mean()
-        sample_vec = contour_guss - contour_order_rstep
-        normal = contour_guss - np.array([x_mean_, y_mean_])
-        if np.cross(sample_vec, normal).mean() > 0:
-            contour_guss = contour_guss[::-1]
-        else:
-            pass
-
-        full_contour_all.append(contour_guss)
+        # 下采样
+        down_sample_guss_point = down_sample(contour, stride=3)
+        full_contour_all.append(contour)
         down_sample_contour.append(down_sample_guss_point)
-    print(count1)
 
+    # 更新 matching_set
     matching_set['full_pcd_all'].extend(full_contour_all)
     matching_set['img_all'].extend(img_all)
     matching_set['extra_img'].extend(extra_all)
     matching_set['shape_all'].extend(list(shapes))
-    matching_set["down_sample_pcd"].append(down_sample_contour)
+    matching_set['down_sample_pcd'].append(down_sample_contour)
 
+    # 计算 GT_pairs 等
     for i in range(len(img_all)):
-        for k in range(i+1, len(img_all), 1):
+        for k in range(i+1, len(img_all)):
             t1, t2 = transforms[i][:2], transforms[k][:2]
             contour1, contour2 = full_contour_all[i], full_contour_all[k]
             contour1 = np.hstack((contour1[:, 1].reshape(-1, 1), contour1[:, 0].reshape(-1, 1)))
@@ -241,15 +210,12 @@ def preprocess(path):
             max_y1, max_y2 = transformed1[:, 1].max(), transformed2[:, 1].max()
             if (max_x2 - min_x1) * (min_x2 - max_x1) > 100 or (max_y2 - min_y1) * (min_y2 - max_y1) > 100:
                 continue
-            else:
-                idx1, idx2 = \
-                    data_preprocess.get_corresbounding(contour1, transformed2, t1)
-                if len(idx1) <= 50:
-                    continue
-                else:
-                    matching_set['source_ind'].append(idx1)
-                    matching_set['target_ind'].append(idx2)
-                    matching_set['GT_pairs'].append([current_nums + i, current_nums + k])
+            idx1, idx2 = data_preprocess.get_corresbounding(contour1, transformed2, t1)
+            if len(idx1) <= 50:
+                continue
+            matching_set['source_ind'].append(idx1)
+            matching_set['target_ind'].append(idx2)
+            matching_set['GT_pairs'].append([current_nums + i, current_nums + k])
 
     return matching_set
 
@@ -257,13 +223,17 @@ def preprocess(path):
 '''------------------------------main-----------------------------'''
 
 # fragment image path
-data_path = "./"
+data_path = os.path.join(ROOT_DIR, 'data', 'circle_sample_V5_2', 'fragments')
 sub_list = os.listdir(data_path)
+sub_list.sort()
 '''get GT transformation'''
 global matching_set
 
 # save path
-root = './'
+save_dir = os.path.join(ROOT_DIR, 'data', 'pkl')
+if not os.path.exists(save_dir):
+    os.makedirs(save_dir)
+root = os.path.join(save_dir, 'matching_set.pkl')
 count = []
 if os.path.exists(root):
     with open(root, 'rb') as file:
@@ -281,16 +251,14 @@ else:
         'down_sample_pcd':[]
     }
 
-
-count = 0
 current_nums = len(matching_set['full_pcd_all'])
-for n in range(len(sub_list)):
-    img_path = os.path.join(data_path, sub_list[n])
-    preprocess(img_path)
+for n, sub in enumerate(sorted(os.listdir(data_path))):
+    img_path = os.path.join(data_path, sub)
+    preprocess(img_path, current_nums)
     current_nums = len(matching_set['full_pcd_all'])
-    print(count)
-    count += 1
-    if count == 390:
-        with open(root, 'wb') as file:
-            pickle.dump(matching_set, file)
-        break
+    print(f"Processed subfolder {n+1}/{len(os.listdir(data_path))}, total fragments: {current_nums}")
+
+# 最终保存
+with open(root, 'wb') as file:
+    pickle.dump(matching_set, file)
+print(f"matching_set.pkl saved with {current_nums} fragments")
