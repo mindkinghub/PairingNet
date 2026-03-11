@@ -248,7 +248,7 @@ def write_to_excel(exp_name, sheetName, search_data, High_1_3_index, Mid_index, 
 if __name__ == "__main__":
 
 
-    decending_index_path = "/home/zhourixin/EXP_folder/saved_index/decending_sorted_scale_index_390.pkl"
+    decending_index_path = "./PairingNet Code/decending_sorted_scale_index_390.pkl"
     with open(decending_index_path, 'rb') as gt_file:
         decending_index = pickle.load(gt_file)
     High_1_3_index = decending_index["H_index"]
@@ -259,7 +259,7 @@ if __name__ == "__main__":
     
     ROOT = "./"
     
-    mat_path = "./sim_matrix_390.pkl"
+    mat_path = "./PairingNet Code/sim_matrix_390.pkl"
     with open(mat_path, 'rb') as gt_file:
         searching_test = pickle.load(gt_file)
     print("#"*20)
