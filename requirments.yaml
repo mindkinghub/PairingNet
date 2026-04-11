@@ -133,6 +133,8 @@ dependencies:
   - zlib=1.2.12=h5eee18b_3
   - zstd=1.5.2=ha4553b6_0
   - pip:
+    - --index-url https://pypi.tuna.tsinghua.edu.cn/simple
+    - --trusted-host pypi.tuna.tsinghua.edu.cn
     - addict==2.4.0
     - axial-positional-embedding==0.2.1
     - backcall==0.2.0
@@ -218,4 +220,3 @@ dependencies:
     - wcwidth==0.2.5
     - werkzeug==2.2.3
     - widgetsnbextension==4.0.6
-prefix: /home/zrx/anaconda3/envs/oracle
