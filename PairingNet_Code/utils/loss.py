@@ -10,6 +10,7 @@ class FocalLoss(nn.Module):
 
         """
         super(FocalLoss, self).__init__()
+        self.eps = 1e-9
         self.size_average = size_average
         self.alpha = alpha
         self.gamma = gamma
@@ -22,12 +23,13 @@ class FocalLoss(nn.Module):
         :return: positive and negative loss, positive loss
         """
 
-        loss_p = - self.alpha * (1 - preds[gt_mask]) ** self.gamma * \
-            torch.log(preds[gt_mask] + torch.tensor([1e-9]).cuda())
+        eps = self.eps  # local alias
 
+        loss_p = - self.alpha * (1 - preds[gt_mask]) ** self.gamma * \
+            torch.log(preds[gt_mask] + eps)
 
         loss_n = - (1 - self.alpha) * preds[~pad_mask_with_gt] ** self.gamma * torch.log(
-            1 - preds[~pad_mask_with_gt] + torch.tensor([1e-9]).cuda())
+            1 - preds[~pad_mask_with_gt] + eps)
 
         if self.size_average:
             loss_np = torch.cat((loss_p, loss_n), 0).mean()
@@ -38,8 +40,8 @@ class FocalLoss(nn.Module):
 
         return 400 * loss_np, loss_p
 
-def ori_focal_loss(conv_m_pre, mask, mask_):
-    loss_m0 = -(1 - conv_m_pre[mask]) ** 2 * torch.log(conv_m_pre[mask] + torch.tensor([1e-9]).cuda())
-    loss_m1 = -conv_m_pre[mask_] ** 2 * torch.log(1 - conv_m_pre[mask_] + torch.tensor([1e-9]).cuda())
+def ori_focal_loss(conv_m_pre, mask, mask_,eps=1e-9):
+    loss_m0 = -(1 - conv_m_pre[mask]) ** 2 * torch.log(conv_m_pre[mask] + eps)
+    loss_m1 = -conv_m_pre[mask_] ** 2 * torch.log(1 - conv_m_pre[mask_] + eps)
     loss_m = 1000 * torch.cat((loss_m0, loss_m1), 0).mean()
     return loss_m, loss_m0.mean(), loss_m1.mean()

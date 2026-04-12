@@ -712,7 +712,12 @@ class STAGE_TWO(Train_model):
         self.device = torch.device("cuda", local_rank)
         torch.cuda.set_device(local_rank)
         models = net(args)
-        models = torch.nn.SyncBatchNorm.convert_sync_batchnorm(models).cuda() 
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        models = torch.nn.SyncBatchNorm.convert_sync_batchnorm(models)
+        models = models.to(device) 
+
         self.models = DDP(models, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
 
 

@@ -1,6 +1,7 @@
 import os, sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), './'))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '../'))
+from .NDCG import calute_NDCG
 # print(os.path.join(os.path.dirname(os.path.abspath(__file__)), './'))
 # print(os.path.join(os.path.dirname(os.path.abspath(__file__)), '../'))
 

@@ -2,6 +2,8 @@ import cv2
 import time
 import torch
 import tqdm
+import psutil
+import os
 import numpy as np
 from torch.utils.data import Dataset
 from encoder import pre_encoder1, pre_encoder2, pre_encoder3, img_patch_encoder
@@ -67,140 +69,154 @@ def generate_tensor(n, max_length):
 class MyDataSet(Dataset):
     def __init__(self, GT_config, args):
         super(MyDataSet, self).__init__()
-        self.inputs = {
-            'full_pcd_all': [],
-            'img_all': [],
-            'c_input': [],
-            't_input': [],
-            'GT_pairs': GT_config['GT_pairs'],
-            "att_mask_s":[],
-            "att_mask_t":[]
-        }
+        # ======================
+        # raw data (only keep raw)
+        # ======================
+        self.raw_pcd = GT_config['full_pcd_all']
+        self.raw_img = GT_config['img_all']
+        self.GT_pairs = np.array(GT_config['GT_pairs'], dtype=np.int32)
+        self.long = list(map(len, self.raw_pcd))
+
         # initial parameters
         self.model = GT_config['model_type']  # train, test, matching
-        patch_size = GT_config['patch_size']  # 3x3, 7x7, 11x11
-        c_model = GT_config['c_model']  # l, io, ilo
-        n = len(GT_config['img_all'])  # nums of fragments
-        pair_n = len(GT_config['GT_pairs'])  # nums of gt pairs
-    
-        c = GT_config['channel']
-        trans = tf.Compose([
-            tf.ToTensor(),
-            tf.Resize(224),
-            tf.Normalize(mean=[0.485, 0.456, 0.406],
-                         std=[0.229, 0.224, 0.225]),
-        ])
+        self.patch_size = GT_config['patch_size']  # 3x3, 7x7, 11x11
+        self.c_model = GT_config['c_model']  # l, io, ilo
+
         # get max point nums
-        self.long = list(map(lambda x: len(x), GT_config['full_pcd_all'])) #每个轮廓的长度
 
         max_points = args.max_length
         self.max_points = max_points
 
+        self.mask_all = torch.zeros(
+            (len(self.GT_pairs), self.max_points, self.max_points),
+            dtype=torch.bool
+        )
+
+        self.adj_all = [self.get_adj(i) for i in range(len(self.raw_img))]
+
+        for i in range(len(self.GT_pairs)):
+            s = GT_config['source_ind'][i]
+            t = GT_config['target_ind'][i]
+            self.mask_all[i][s, t] = True
+        n = len(self.raw_img)
+    
+        c = GT_config['channel']
+        self.trans = tf.Compose([
+            tf.ToTensor(),
+            tf.Resize((224, 224)),
+            tf.CenterCrop((224, 224)),
+            tf.Normalize(mean=[0.485, 0.456, 0.406],
+                         std=[0.229, 0.224, 0.225]),
+        ])
         # get max img shape
         shape_all = np.array(GT_config['shape_all'])
         shape_all = torch.from_numpy(shape_all)[:, :2]
-        height_max = 1319  # length of max length
-        width_max = height_max
-        mid_area = height_max ** 2
+        self.height_max = 1319  # length of max length
+        self.width_max = self.height_max
+        self.mid_area = self.height_max ** 2
 
-        print("Update adjacency matrix")
-        for i in tqdm.trange(n):
+        self.att_mask_s = torch.zeros(len(self.GT_pairs), 1, 1)
+        self.att_mask_t = torch.zeros(len(self.GT_pairs), 1, 1)
 
-            GT_config['adj_all'][i] = get_adjacent2(GT_config['full_pcd_all'][i], max_points, k = 8)
+        if self.model != 'searching':
+            pair_n = len(self.GT_pairs)
 
-        # initial inputs
-        self.inputs['full_pcd_all'] = torch.zeros((n, max_points, 2))  # input contours
-        self.inputs['c_input'] = torch.zeros((n, max_points, patch_size, patch_size))  # input patches
-        self.inputs['t_input'] = torch.zeros((n, max_points, 3, patch_size, patch_size))  # input patches
-        self.inputs['img_all'] = torch.zeros((n, c, 224, 224))  # input image
-        self.inputs['adj_all'] = GT_config['adj_all']
-        self.inputs['factor'] = torch.zeros(n)  
+            self.mask_all = torch.zeros((pair_n, self.max_points, self.max_points), dtype=torch.bool)
 
-        #  deal with each inputs of fragments
-        print('dealing with fragments')
-        for i in tqdm.trange(n):
-      
-            '''points'''
-            full_pcd = GT_config['full_pcd_all'][i]
-            self.inputs['full_pcd_all'][i][0:self.long[i]] = torch.from_numpy(full_pcd)
+            for i in range(pair_n):
+                s, t = GT_config['source_ind'][i], GT_config['target_ind'][i]
+                self.mask_all[i][s, t] = True
 
+        self.full_s_buf = np.zeros((self.max_points, 2), dtype=np.float32)
+        self.full_t_buf = np.zeros((self.max_points, 2), dtype=np.float32)
 
-            '''img_ori'''
-            temp_empty_img = np.zeros((height_max, width_max, c), dtype=np.uint8) 
-            temp_empty_img[:shape_all[i][1], :shape_all[i][0]] = cv2.cvtColor(GT_config['img_all'][i],
-                                                                                          cv2.COLOR_BGR2RGB)                                                                            
-            # resize 2 224 x 224
-            new_img = trans(temp_empty_img)
-            self.inputs['img_all'][i] = new_img
-            self.inputs['factor'][i] = 1
+    def get_adj(self, i):
+        n = self.long[i]
+        adj = np.eye(n, dtype=np.float32)
 
-            # input patches
-            img = cv2.cvtColor(GT_config['img_all'][i], cv2.COLOR_BGR2RGB) # 311，298，3
-            img = np.pad(img, ((0, 20), (0, 20), (0, 0)), 'constant', constant_values=(0, 0)) # 331，318，3
-            img = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0) / 255 # 1,3,331,318
-            t_input = img_patch_encoder(img, self.inputs['full_pcd_all'][i].unsqueeze(0), patch_size)
-            self.inputs['t_input'][i] = t_input[0]
-            img = (GT_config['img_all'][i] != 0).all(-1)  # get extracted template
-            img = np.pad(img, ((0, 20), (0, 20)), 'constant', constant_values=(0, 0))
-            img = torch.from_numpy(img).float().unsqueeze(0) #这一步之后，有像素的地方都是1，无像素的地方都是0
+        k = 8
+        for j in range(k):
+            adj += np.roll(np.eye(n), j + 1, axis=0)
+            adj += np.roll(np.eye(n), -j - 1, axis=0)
 
-            if c_model == 'l':  # only contour line
-                c_input = pre_encoder1(img, self.inputs['full_pcd_all'][i].unsqueeze(0), patch_size) # 1,2778,7,7
-            elif c_model == 'io':  # Interior and exterior of contour
-                c_input = pre_encoder2(img, self.inputs['full_pcd_all'][i].unsqueeze(0), patch_size)
-            else:  # Interior, exterior and contour
-                c_input = pre_encoder3(img, self.inputs['full_pcd_all'][i].unsqueeze(0), patch_size)
-            self.inputs['c_input'][i] = c_input[0]
-        self.inputs['shape'] = [height_max, height_max]
+        full_adj = np.zeros((self.max_points, self.max_points), dtype=np.float32)
+        full_adj[:n, :n] = adj
 
-        # points normalization
-        self.inputs['full_pcd_all'] = self.inputs['full_pcd_all'] / (height_max / 2.) - 1
-
-        #  deal with correctly matched pairs into matrix
-        if GT_config['model_type'] != 'searching':
-            print("dealing with gt pairs into matrix")
-            self.inputs['mask_all'] = []
-            self.inputs['att_mask_s'] = []
-            self.inputs['att_mask_t'] = []
-            for i in tqdm.trange(pair_n):
-                source_intersection_ind = GT_config['source_ind'][i]
-                target_intersection_ind = GT_config['target_ind'][i]
-                mask = torch.zeros((max_points, max_points), dtype=torch.bool)
-                mask[source_intersection_ind, target_intersection_ind] = True
-
-                self.inputs['mask_all'].append(mask)
-                self.inputs['att_mask_s'].append(torch.zeros((1,1)))
-                self.inputs['att_mask_t'].append(torch.zeros((1,1)))
-
-            self.inputs['mask_all'] = torch.stack(self.inputs['mask_all'], 0)
-            self.inputs['att_mask_s'] = torch.stack(self.inputs['att_mask_s'], 0)
-            self.inputs['att_mask_t'] = torch.stack(self.inputs['att_mask_t'], 0)
+        return torch.from_numpy(full_adj)
 
     def __len__(self):
-        if self.model in ["searching_train", "searching_test", "save_stage1_feature"]:
-            return len(self.inputs['img_all'])
-        elif self.model in ["matching_train", "matching_test"]:
-            return len(self.inputs['GT_pairs'])
+        if self.model in ["matching_train", "matching_test"]:
+            return len(self.GT_pairs)
+        else:
+            return len(self.raw_img)
 
     def __getitem__(self, idx):
-        self.inputs['GT_pairs'] = np.array(self.inputs['GT_pairs'])
-        if self.model == 'matching_train' or self.model == 'matching_test':
-            idx_s, idx_t = self.inputs['GT_pairs'][idx]
-            full_s, full_t = self.inputs['full_pcd_all'][idx_s], self.inputs['full_pcd_all'][idx_t]
-            return \
-                (self.inputs['mask_all'][idx], self.long[idx_s], self.long[idx_t],idx_s, idx_t), \
-                (self.inputs['img_all'][idx_s], self.inputs['img_all'][idx_t]), \
-                (full_s, full_t), \
-                (self.inputs['c_input'][idx_s], self.inputs['c_input'][idx_t]), \
-                (self.inputs['t_input'][idx_s], self.inputs['t_input'][idx_t]), \
-                (self.inputs['adj_all'][idx_s], self.inputs['adj_all'][idx_t]), \
-                (self.inputs['factor'][idx_s], self.inputs['factor'][idx_t]), \
-                (self.inputs['att_mask_s'][idx], self.inputs['att_mask_t'][idx])
+        # print("RAM:", psutil.Process(os.getpid()).memory_info().rss / 1024**3, "GB")
+        if self.model in ['matching_train', 'matching_test']:
 
+            idx_s, idx_t = self.GT_pairs[idx]
+            idx_s, idx_t = int(idx_s), int(idx_t)
 
-        elif self.model == 'save_stage1_feature' :
-            return self.inputs['full_pcd_all'][idx], self.inputs['img_all'][idx], self.inputs['t_input'][idx], \
-                   self.inputs['adj_all'][idx], self.inputs['factor'][idx], self.inputs['c_input'][idx]
+            # ---- point cloud ----
+
+            n_s = int(self.long[idx_s])
+            n_t = int(self.long[idx_t])
+
+            full_s = self.full_s_buf.copy()
+            full_t = self.full_t_buf.copy()
+            full_s[:n_s] = self.raw_pcd[idx_s][:n_s]
+            full_t[:n_t] = self.raw_pcd[idx_t][:n_t]
+
+            full_s = torch.from_numpy(full_s)
+            full_t = torch.from_numpy(full_t)
+
+            full_s = full_s / (self.height_max / 2.) - 1
+            full_t = full_t / (self.height_max / 2.) - 1
+
+            # ---- image (on demand) ----
+
+            img_s = self.trans(self.raw_img[idx_s])
+            print("img_s tensor:", img_s.shape, img_s.element_size() * img_s.nelement() / 1024**2, "MB")
+            img_t = self.trans(self.raw_img[idx_t])
+            print("img_t tensor:", img_t.shape, img_t.element_size() * img_t.nelement() / 1024**2, "MB")
+
+            # ---- adjacency (lazy) ----
+            adj_s = self.adj_all[idx_s]
+            adj_t = self.adj_all[idx_t]
+
+            c_s = torch.zeros((self.max_points, self.patch_size, self.patch_size))
+            c_t = torch.zeros((self.max_points, self.patch_size, self.patch_size))
+
+            t_s = torch.zeros((self.max_points, 3, self.patch_size, self.patch_size))
+            t_t = torch.zeros((self.max_points, 3, self.patch_size, self.patch_size))
+
+            factors = (1.0, 1.0)
+
+            mask = self.mask_all[idx]
+
+            att_mask = (self.att_mask_s[idx], self.att_mask_t[idx])
+
+            return (
+            (mask, n_s, n_t, idx_s, idx_t),        
+            (img_s, img_t),   
+            (full_s, full_t), 
+            (c_s, c_t),       
+            (t_s, t_t),       
+            (adj_s, adj_t),
+            factors,
+            att_mask        
+            )
+        elif self.model == 'save_stage1_feature':
+            n = self.long[idx]
+            full = np.zeros((self.max_points, 2), dtype=np.float32)
+            full[:n] = self.raw_pcd[idx]
+
+            full = torch.from_numpy(full)
+            full = full / (self.height_max / 2.) - 1
+
+            img = self.trans(self.raw_img[idx])
+
+            return full, img, self.get_adj(idx), n
 
 
 class MyDataSet_searching(Dataset):

@@ -218,4 +218,10 @@ dependencies:
     - wcwidth==0.2.5
     - werkzeug==2.2.3
     - widgetsnbextension==4.0.6
+    - pytorch-warmup
+    - torchsummary
+    - tensorboardx
+    - opencv-python
+    - matplotlib
+    - tqdm
 prefix: /home/zrx/anaconda3/envs/oracle

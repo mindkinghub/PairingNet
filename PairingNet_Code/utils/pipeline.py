@@ -104,20 +104,21 @@ class Vanilla(nn.Module):
         img = inputs['img']  # bs, n, 3, 7, 7
         c_input = inputs['c_input']
         t_input = inputs['t_input']
+        device = contour.device
         bs, c, _, _ = img.size()
         adj = inputs['adj']
         # att_mask = inputs['att_mask']
         _, n, _, _ = c_input.shape
         c_feature = self.c_feature
         
-        contour += torch.tensor([1, 1]).cuda()
+        contour += torch.tensor([1, 1], device=device)
         
         flatted_c = self.flatten_net(c_input)
 
         # _, c = flatted_c.shape
         flatted_c = flatted_c.view(bs, n, -1)
         contour_in_c = contour - torch.mean(contour, dim=1, keepdim=True)
-        contour_in_c -= torch.tensor([1, 1]).cuda()
+        contour_in_c -= torch.tensor([1, 1], device=device)
         flatted_c = torch.cat((flatted_c, contour_in_c), dim=-1)
         flatted_c = self.fc(flatted_c)
         flatted_c = flatted_c.view(-1, c_feature)
