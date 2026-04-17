@@ -176,9 +176,9 @@ class MyDataSet(Dataset):
             # ---- image (on demand) ----
 
             img_s = self.trans(self.raw_img[idx_s])
-            print("img_s tensor:", img_s.shape, img_s.element_size() * img_s.nelement() / 1024**2, "MB")
+            # print("img_s tensor:", img_s.shape, img_s.element_size() * img_s.nelement() / 1024**2, "MB")
             img_t = self.trans(self.raw_img[idx_t])
-            print("img_t tensor:", img_t.shape, img_t.element_size() * img_t.nelement() / 1024**2, "MB")
+            # print("img_t tensor:", img_t.shape, img_t.element_size() * img_t.nelement() / 1024**2, "MB")
 
             # ---- adjacency (lazy) ----
             adj_s = self.adj_all[idx_s]
@@ -208,53 +208,129 @@ class MyDataSet(Dataset):
             )
         elif self.model == 'save_stage1_feature':
             n = self.long[idx]
-            full = np.zeros((self.max_points, 2), dtype=np.float32)
-            full[:n] = self.raw_pcd[idx]
 
-            full = torch.from_numpy(full)
+            # ===== 点云（raw + normalized）=====
+            full_raw_np = np.zeros((self.max_points, 2), dtype=np.float32)
+            full_raw_np[:n] = self.raw_pcd[idx]
+
+            full = torch.from_numpy(full_raw_np.copy())
             full = full / (self.height_max / 2.) - 1
 
-            img = self.trans(self.raw_img[idx])
+            full_raw = torch.from_numpy(full_raw_np)
 
-            return full, img, self.get_adj(idx), n
+            # ===== 图像 =====
+            img_np = self.raw_img[idx]
+            img = self.trans(img_np)
+
+            # ===== 邻接矩阵 =====
+            adj = self.get_adj(idx)
+
+            # ===== t_input =====
+            img_pad = np.zeros((self.height_max, self.width_max, 3), dtype=np.uint8)
+            h, w = img_np.shape[:2]
+            img_pad[:h, :w] = cv2.cvtColor(img_np, cv2.COLOR_BGR2RGB)
+            img_pad = torch.from_numpy(img_pad).permute(2, 0, 1).unsqueeze(0) / 255.0
+
+            t_input = img_patch_encoder(
+                img_pad,
+                full_raw.unsqueeze(0),
+                self.patch_size
+            )[0]
+
+            # ===== c_input =====
+            mask_np = np.zeros((self.height_max, self.width_max), dtype=np.float32)
+            mask_np[:h, :w] = (img_np.sum(-1) > 0)
+            mask = torch.from_numpy(mask_np).unsqueeze(0)
+
+            if self.c_model == 'l':
+                c_input = pre_encoder1(mask, full_raw.unsqueeze(0), self.patch_size)[0]
+            elif self.c_model == 'io':
+                c_input = pre_encoder2(mask, full_raw.unsqueeze(0), self.patch_size)[0]
+            else:
+                c_input = pre_encoder3(mask, full_raw.unsqueeze(0), self.patch_size)[0]
+
+            factor = 1.0
+
+            return full, img, t_input, adj, factor, c_input
 
 
 class MyDataSet_searching(Dataset):
     def __init__(self, stage1_feature, args):
-        self.stage1_feature = stage1_feature["saved_feature"]
-        self.GT_pairs = stage1_feature["GT_pairs"]
-        self.full_pcd = stage1_feature["full_pcd"]
+        
+        raw_feat = stage1_feature["saved_feature"]
+        raw_pcd = stage1_feature["full_pcd"]
+        raw_pairs = stage1_feature["GT_pairs"]
+
         self.model = args.model_type
-        self.adj = []
-        self.inputs = {
-            'full_pcd_all': [],
-            'source_ind':stage1_feature["source_ind"],
-            'target_ind':stage1_feature["target_ind"]
-        }
+        self.max_points = args.max_length
+        # =========================
+        # 1. 过滤 None 样本
+        # =========================
+        self.stage1_feature = []
+        self.full_pcd = []
+        for i in range(len(raw_feat)):
+            if raw_feat[i] is None or raw_pcd[i] is None:
+                continue
+            self.stage1_feature.append(raw_feat[i])
+            self.full_pcd.append(raw_pcd[i])
 
+        print(f"✅ valid samples: {len(self.stage1_feature)}")
         n = len(self.full_pcd)
-        max_points = args.max_length
-        self.inputs['full_pcd_all'] = torch.zeros((n, max_points, 2))
-        self.long = list(map(lambda x: len(x), self.full_pcd))
-        height_max = 1319
+        # =========================
+        # 2. padding point cloud
+        # =========================
+        self.full_pcd_all = torch.zeros((n, self.max_points, 2))
 
-        self.inputs['full_pcd_all'] = self.inputs['full_pcd_all'] / (height_max / 2.) - 1
+        for i in range(n):
+            num = min(len(self.full_pcd[i]), self.max_points)
+            self.full_pcd_all[i, :num] = torch.tensor(self.full_pcd[i][:num])
 
+        # =========================
+        # 3. 重新构建 GT_pairs（防越界）
+        # =========================
+        self.GT_pairs = []
+
+        for s, t in raw_pairs:
+            if s < n and t < n:
+                self.GT_pairs.append((s, t))
+
+        print(f"✅ valid pairs: {len(self.GT_pairs)}")
     
     def __len__(self):
-        if self.model == 'stage2':
-            return len(self.GT_pairs)
-        elif self.model == 'stage2_searching':
-            return len(self.stage1_feature)
+        return len(self.GT_pairs)
+
 
     def __getitem__(self, idx):
-        if self.model == 'stage2':
-            idx_s, idx_t = self.GT_pairs[idx]
-            return (self.stage1_feature[idx_s], self.stage1_feature[idx_t], idx_s, idx_t, self.inputs['full_pcd_all'][idx_s], self.inputs['full_pcd_all'][idx_t]), \
-                  (self.long[idx_s], self.long[idx_t])
 
-        elif self.model == 'stage2_searching':
-            return self.stage1_feature[idx], self.inputs['full_pcd_all'][idx]
+        s, t = self.GT_pairs[idx]
+
+        feat_s = self.stage1_feature[s]
+        feat_t = self.stage1_feature[t]
+
+        pcd_s = self.full_pcd_all[s]
+        pcd_t = self.full_pcd_all[t]
+
+        if feat_s is None or feat_t is None:
+            raise ValueError(f"None feature at pair {idx}: {s},{t}")
+
+        # =========================
+        # ① all_data（6字段）
+        # =========================
+        all_data = (
+            feat_s,
+            feat_t,
+            s,
+            t,
+            pcd_s,
+            pcd_t
+        )
+
+        # =========================
+        # ② mask_para（训练用辅助信息）
+        # =========================
+        mask_para = (self.full_pcd[s].shape[0], self.full_pcd[t].shape[0])
+
+        return all_data, mask_para
 
 
 class MyRealDataSet(Dataset):

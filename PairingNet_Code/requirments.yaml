@@ -224,4 +224,5 @@ dependencies:
     - opencv-python
     - matplotlib
     - tqdm
+    - ipdb
 prefix: /home/zrx/anaconda3/envs/oracle

@@ -160,7 +160,7 @@ class TransformerEncoderModel(nn.Module):
             n_local_attn_heads = 4
         )
 
-
+        self.input_proj = nn.Linear(32, 64)
         self.act = nn.Tanh()
         self.out_l_1 = nn.Linear(args.in_channels_stage2, args.global_out_channels)
         self.fc_s = nn.Linear(args.max_length, args.max_length//2)
@@ -184,8 +184,13 @@ class TransformerEncoderModel(nn.Module):
 
     def forward(self, src, contour):
 
-        src_c = src[:,:self.tranct_length,0:64]
-        src_t = src[:,:self.tranct_length,64:]
+        # 1. 强制保证 feature = 64
+        if src.shape[-1] != 64:
+            src = self.input_proj(src)
+        src = src[:, :self.tranct_length, :]
+
+        src_c = src
+        src_t = src
 
         src_c = self.transformer_encoder_c(src_c)
         src_t = self.transformer_encoder_t(src_t)

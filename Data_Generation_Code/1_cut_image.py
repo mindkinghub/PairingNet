@@ -1020,7 +1020,7 @@ def image_rotate_funcV2(img, angle, intersections, pad_=10):
         len_list = list(map(len, pcd_p))
         min_len = min(len_list)
         if min_len >= 5 and len(len_list) >= 2:
-            print('遇到问题，正在重试。。。')
+            # print('遇到问题，正在重试。。。')
             return False
         tar = pcd_p[0]
         for va in pcd_p:
@@ -1101,7 +1101,7 @@ def random_segmentation_circle(imgs):
     img, M, rotated_point = cur_return
     a = img.shape[0]
     if rotated_point[0][1] < 100 or rotated_point[0][1] > img.shape[0]-100: # 避免切割线太靠近边缘
-        print('切割线太靠近边缘，正在重试。。。')
+        # print('切割线太靠近边缘，正在重试。。。')
         return False
     roated_img = img
     
@@ -1125,7 +1125,7 @@ def random_segmentation_circle(imgs):
             min_len = min(len_list)
             
             if min_len >= 5 and len(len_list) >= 2:
-                print('遇到问题，正在重试。。。')
+                # print('遇到问题，正在重试。。。')
                 return False
             # if len(len_list) >= 2:
             #     print('遇到问题，正在重试。。。')
@@ -1136,12 +1136,13 @@ def random_segmentation_circle(imgs):
                     tar = va
             pcd_basic = tar
         else: 
-            print('遇到问题，正在重试。。。')
+            # print('遇到问题，正在重试。。。')
             return False
 
     cut_result = function.function(basic_cover, sizes,rotated_point,pcd_basic)
     if cut_result is False:
-        print('找不到轮廓内切割点，正在重试。。。')
+        # print('找不到轮廓内切割点，正在重试。。。')
+        
         return False
     mask_p_cover, mask_n_cover, p_cover_area, n_cover_area, paint_point, paint_line = cut_result
     cover_pcd_p, cover_pcd_n = basic_cover[mask_p_cover], basic_cover[mask_n_cover]
@@ -1166,7 +1167,7 @@ def random_segmentation_circle(imgs):
         if len_list:
             min_len = min(len_list)
             if min_len >= 2 and len(len_list) >= 2:
-                print('遇到问题，正在重试。。。')
+                # print('遇到问题，正在重试。。。')
                 return False
             # if len(len_list) >= 2:
             #     print('遇到问题，正在重试。。。')
@@ -1177,7 +1178,7 @@ def random_segmentation_circle(imgs):
                     tar = va
             pcd_p = tar
         else:
-            print('遇到问题，正在重试。。。')
+            # print('遇到问题，正在重试。。。')
             return False
 
     if isinstance(pcd_n, tuple):
@@ -1186,7 +1187,7 @@ def random_segmentation_circle(imgs):
             min_len = min(len_list)
             
             if min_len >= 5 and len(len_list) >= 2:
-                print('遇到问题，正在重试。。。')
+                # print('遇到问题，正在重试。。。')
                 return False
             # if len(len_list) >= 2:
             #     print('遇到问题，正在重试。。。')
@@ -1197,7 +1198,7 @@ def random_segmentation_circle(imgs):
                     tar = va
             pcd_n = tar
         else: 
-            print('遇到问题，正在重试。。。')
+            # print('遇到问题，正在重试。。。')
             return False
     try:
         pcd_p = np.asarray(pcd_p, dtype=np.float).reshape(-1, 2)
@@ -1206,7 +1207,7 @@ def random_segmentation_circle(imgs):
         # pcd_p, pcd_n = ordering_point(pcd_p), ordering_point(pcd_n)  # 获取有顺序的排序
         # pcd_p, pcd_n = contour_interpolation(pcd_p, 8), contour_interpolation(pcd_n, 8)  # 轮廓平滑插值
     except:
-        print('遇到问题，正在重试。。。')
+        # print('遇到问题，正在重试。。。')
         return False
     '''随机旋转图片并获得对应点集图片和旋转矩阵'''
     ## 这一步没有对碎片进行缩放，但是将外包围从原来的整幅图像调整为包围住轮廓，再往外扩展一定像素的框
@@ -1288,7 +1289,7 @@ def random_segmentation_circle(imgs):
 if __name__ == '__main__':
     print('正在处理数据目录')
 
-    root = '../DATASET'  # 所有包含一张图片的文件夹的路径
+    root = '../DATASET/test_image'  # 所有包含一张图片的文件夹的路径
     # root = '/home/zrx/lab_disk1/zhourixin/oracle/make+fragment/make fragment/my dataset/all/car'
 
     # segment_logic = "origin"
@@ -1305,6 +1306,13 @@ if __name__ == '__main__':
         os.makedirs(save_root, exist_ok=True)
         os.makedirs(process_root, exist_ok=True)
         os.makedirs(areaJPG_root, exist_ok=True)
+
+        processed_file = os.path.join(areaJPG_root, "processed.txt")
+        if os.path.exists(processed_file):
+            with open(processed_file, "r") as f:
+                processed_set = set(line.strip() for line in f.readlines())
+        else:
+            processed_set = set()
         # 读取图片列表
         img_list = os.listdir(root)
         area_list=np.array([])
@@ -1314,16 +1322,22 @@ if __name__ == '__main__':
         print("max_area:%f, min_area:%f" % (max_area, min_area))
         for m in range(len(img_list)):
             res_list = []  # 储存所有不再继续分割的碎片的对象的列表
-
+            img_name = img_list[m]
+            if img_name in processed_set:
+                print(f"[SKIP] {img_name} already processed")
+                continue
+            print(f"\n[PROCESS] {img_name}")
             
             print('正在处理第 {} 张图片'.format(m))
-            idx = 0
+            
             '''读取原图'''
             img_path = os.path.join(root, img_list[m])
             img1 = cv2.imread(img_path, cv2.IMREAD_UNCHANGED) 
             if img1 is None:
                 print(f"无法读取图片: {img_path}")
                 continue
+            
+            idx = 0
             this_image_area_list = []
             this_image_area = img1.size / 3
 
@@ -1558,6 +1572,9 @@ if __name__ == '__main__':
 
             for idx in range(len(fragment_list)):
                 save_fragment(fragment_list[idx], saved_path, idx, bg)
+            processed_set.add(img_name)
+            with open(processed_file, "a") as f:
+                f.write(img_name + "\n")
             with open(os.path.join(saved_path, 'bg.txt'), 'w') as f:
                 f.write(str(bg)[1:-1])
 

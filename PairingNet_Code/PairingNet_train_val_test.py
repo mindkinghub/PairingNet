@@ -146,25 +146,25 @@ class Train_model(object):
 
         return pad_mask
 
+    @staticmethod
     def get_concat_adj(adj, max_len):
         device = adj.device
-        temp_adj = torch.zeros((2, 0), dtype=torch.int).to(device)
-        for i in range(len(adj)):
-            b = torch.nonzero(adj[i]).transpose(0, 1)
-            # a = adj[i].coalesce().indices() #(2,8602)
-            temp_adj = torch.hstack((temp_adj, b + i * max_len))
 
-        return temp_adj
-    @staticmethod
-    def get_concat_adj2(adj, max_len):
-        device = adj.device
-        temp_adj = torch.zeros((2, 0), dtype=torch.int).to(device)
-        for i in range(len(adj)):
-            b = torch.nonzero(adj[i]).transpose(0, 1)
-            # a = adj[i].coalesce().indices() #(2,8602)
-            temp_adj = torch.hstack((temp_adj, b + i * max_len))
+        all_edges = []
 
-        return temp_adj
+        for i in range(len(adj)):
+            idx = torch.nonzero(adj[i]).t()   # [2, E]
+
+            if idx.numel() == 0:
+                continue
+
+            idx = idx + i * max_len
+            all_edges.append(idx)
+
+        if len(all_edges) == 0:
+            return torch.zeros((2, 0), dtype=torch.long, device=device)
+
+        return torch.cat(all_edges, dim=1)
     
 
     def get_similarity_matrix(self, feature1, feature2, pad_mask):
@@ -208,8 +208,8 @@ class Train_model(object):
 
             for _, (mask_para, imgs, pcd, c_input, t_input, adjs, factors, att_mask) in enumerate(tqdm(self.train_loader)):
                 max_point_nums = len(pcd[0][0])
-                adj_s = self.get_concat_adj2(adjs[0], max_point_nums)
-                adj_t = self.get_concat_adj2(adjs[1], max_point_nums)
+                adj_s = self.get_concat_adj(adjs[0], max_point_nums)
+                adj_t = self.get_concat_adj(adjs[1], max_point_nums)
                 # adj_s = adj_s.to(device)
 
                 source_input = {
@@ -252,8 +252,8 @@ class Train_model(object):
             self.models.requires_grad_(False)
             for _, (mask_para, imgs, pcd, c_input, t_input, adjs, factors, att_mask) in enumerate(tqdm(self.valid_loader)):
                 max_point_nums = len(pcd[0][0])
-                adj_s = self.get_concat_adj2(adjs[0], max_point_nums)
-                adj_t = self.get_concat_adj2(adjs[1], max_point_nums)
+                adj_s = self.get_concat_adj(adjs[0], max_point_nums)
+                adj_t = self.get_concat_adj(adjs[1], max_point_nums)
 
                 source_input = {
                     'pcd': pcd[0].to(device), 'img': imgs[0].to(device), 'c_input': c_input[0].to(device),
@@ -610,7 +610,7 @@ class STAGE_ONE(Train_model):
         for batch, (pcd, imgs, t_input, adj, factor, c_input) in enumerate(tqdm(self.train_loader)):
             max_point_nums = len(pcd[0])
             # origin_adj = adj.clone()
-            adj = self.get_concat_adj2(adj, max_point_nums)
+            adj = self.get_concat_adj(adj, max_point_nums)
             inputs = {
                 'pcd': pcd.to(device), 'img': imgs.to(device), 't_input': t_input.to(device),
                 'adj': adj.to(device), 'factor': factor.to(device), 'c_input': c_input.to(device)
@@ -638,7 +638,7 @@ class STAGE_ONE(Train_model):
         for batch, (pcd, imgs, t_input, adj, factor, c_input) in enumerate(tqdm(self.valid_loader)):
             max_point_nums = len(pcd[0])
             # origin_adj = adj.clone()
-            adj = self.get_concat_adj2(adj, max_point_nums)
+            adj = self.get_concat_adj(adj, max_point_nums)
             inputs = {
                 'pcd': pcd.to(device), 'img': imgs.to(device), 't_input': t_input.to(device),
                 'adj': adj.to(device), 'factor': factor.to(device), 'c_input': c_input.to(device)
@@ -665,7 +665,7 @@ class STAGE_ONE(Train_model):
         for batch, (pcd, imgs, t_input, adj, factor, c_input) in enumerate(tqdm(self.test_loader)):
             max_point_nums = len(pcd[0])
             # origin_adj = adj.clone()
-            adj = self.get_concat_adj2(adj, max_point_nums)
+            adj = self.get_concat_adj(adj, max_point_nums)
             inputs = {
                 'pcd': pcd.to(device), 'img': imgs.to(device), 't_input': t_input.to(device),
                 'adj': adj.to(device), 'factor': factor.to(device), 'c_input': c_input.to(device)
@@ -689,10 +689,11 @@ class STAGE_TWO(Train_model):
     def __init__(self, net, args, temperature, case_name, save_img=False, save_corres=False, save_w=False,
                  save_gt=False):
         print('set training dataset')
+        base = os.path.join(args.stage2_feature_path, case_name)
         self.args = args
-        self.saved_train_feature_path = args.stage2_feature_path+'/{}/train_feature_{}.pkl'.format(case_name, args.dataset_select)
-        self.saved_val_feature_path = args.stage2_feature_path+'/{}/val_feature_{}.pkl'.format(case_name, args.dataset_select)
-        self.saved_test_feature_path = args.stage2_feature_path+'/{}/test_feature_{}.pkl'.format(case_name, args.dataset_select)
+        self.saved_train_feature_path = self.find_feature(base, "train_feature_*.pkl")
+        self.saved_val_feature_path = self.find_feature(base, "val_feature_*.pkl")
+        self.saved_test_feature_path = self.find_feature(base, "test_feature_*.pkl")
         self.log_save_path = EXP_path+'/EXP2/{}/summary'.format(case_name)
         self.writer = SummaryWriter(self.log_save_path)
         self.case_name = case_name
@@ -703,35 +704,50 @@ class STAGE_TWO(Train_model):
         if not os.path.exists(self.checkpoint_path):
             os.makedirs(self.checkpoint_path, exist_ok=True)
 
-        # DDP
-        torch.distributed.init_process_group(backend="nccl")
-        local_rank = torch.distributed.get_rank()
-        random_seed = 20
-        init_seeds(random_seed+torch.distributed.get_rank())
-        # local_rank = args.local_rank
-        self.device = torch.device("cuda", local_rank)
-        torch.cuda.set_device(local_rank)
-        models = net(args)
+        # # DDP
+        # torch.distributed.init_process_group(backend="nccl")
+        # local_rank = torch.distributed.get_rank()
+        # random_seed = 20
+        # init_seeds(random_seed+torch.distributed.get_rank())
+        # # local_rank = args.local_rank
+        # self.device = torch.device("cuda", local_rank)
+        # torch.cuda.set_device(local_rank)
+        # models = net(args)
 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        models = torch.nn.SyncBatchNorm.convert_sync_batchnorm(models)
-        models = models.to(device) 
+        # models = torch.nn.SyncBatchNorm.convert_sync_batchnorm(models)
+        # models = models.to(device) 
 
-        self.models = DDP(models, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
+        # self.models = DDP(models, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
 
 
 
-        self.train_data, _ = self.set_dataset_searching(self.saved_train_feature_path, args)
-        self.train_sampler = DistributedSampler(self.train_data)
-        self.train_loader = DataLoader(self.train_data, args.batch_size, num_workers=0, sampler=self.train_sampler)
-        # self.train_loader = DataLoader(self.train_data, args.batch_size, num_workers=0, shuffle=True)
+        # self.train_data, _ = self.set_dataset_searching(self.saved_train_feature_path, args)
+        # self.train_sampler = DistributedSampler(self.train_data)
+        # self.train_loader = DataLoader(self.train_data, args.batch_size, num_workers=0, sampler=self.train_sampler)
+        # # self.train_loader = DataLoader(self.train_data, args.batch_size, num_workers=0, shuffle=True)
 
-        self.val_data, _ = self.set_dataset_searching(self.saved_val_feature_path, args)
-        self.val_loader = DataLoader(self.val_data, args.batch_size, num_workers=0, sampler=DistributedSampler(self.val_data))
-        # self.val_loader = DataLoader(self.val_data, args.batch_size, num_workers=0, shuffle=True)
+        # self.val_data, _ = self.set_dataset_searching(self.saved_val_feature_path, args)
+        # self.val_loader = DataLoader(self.val_data, args.batch_size, num_workers=0, sampler=DistributedSampler(self.val_data))
+        # # self.val_loader = DataLoader(self.val_data, args.batch_size, num_workers=0, shuffle=True)
         
         # self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        # ===== 单卡设备 =====
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # ===== 初始化模型 =====
+        models = net(args)
+        models = models.to(self.device)
+
+        self.models = models
+
+        self.train_data, _ = self.set_dataset_searching(self.saved_train_feature_path, args)
+        self.train_loader = DataLoader(self.train_data, args.matching_batch_size, shuffle=True, num_workers=0)
+
+        self.val_data, _ = self.set_dataset_searching(self.saved_val_feature_path, args)
+        self.val_loader = DataLoader(self.val_data, args.matching_batch_size, shuffle=False, num_workers=0)
+
         
         # self.models.to(self.device)
         self.contrast_temperature = args.contrast_temperature
@@ -741,6 +757,13 @@ class STAGE_TWO(Train_model):
                                           lr=args.stage2_lr,
                                           weight_decay=args.stage2_weight_decay)
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=args.stage2_epoch)
+
+    def find_feature(self, path, pattern):
+        files = glob(os.path.join(path, pattern))
+        print("Searching:", os.path.join(path, pattern))
+        print("Found:", files)
+        assert len(files) > 0, f"No file found for {pattern}"
+        return sorted(files)[-1]
 
     def warmup(self, current_step: int):
         return 1 / (10 ** (float(self.args.warmup_steps - current_step)))
@@ -759,7 +782,8 @@ class STAGE_TWO(Train_model):
         if not os.path.exists(path):
             torch.save({  # 'state': torch.cuda.get_rng_state_all(),
                 'epoch': epoch,
-                'model_state_dict': self.models.module.state_dict(),
+                # 'model_state_dict': self.models.module.state_dict(),
+                'model_state_dict': self.models.state_dict(),
                 'optimizer_state_dict': self.optimizer.state_dict()}, path)
     
     def get_max_file_number(self, directory):
@@ -853,7 +877,7 @@ class STAGE_TWO(Train_model):
             self.models.requires_grad_(True)
 
             for e, (stage1_features) in enumerate(tqdm(self.train_loader)):
-                self.train_sampler.set_epoch(e)
+                # self.train_sampler.set_epoch(e)
                 all_data, mask_para = stage1_features
                 stage1_features_s, stage1_features_t, index_s, index_t, pcd_s, pcd_t = all_data
                 stage1_features_s, stage1_features_t, pcd_s, pcd_t = stage1_features_s.to(self.device), stage1_features_t.to(self.device), pcd_s.to(self.device), pcd_t.to(self.device)
@@ -893,7 +917,8 @@ class STAGE_TWO(Train_model):
 
             self.scheduler.step()
 
-            if torch.distributed.get_rank() in [1]:
+            # if torch.distributed.get_rank() in [1]:
+            if True:
                 self.writer.add_scalar('train_loss', loss_m_all.mean(), i)
                 self.writer.add_scalar('Stage2_Infor_loss_train', infor_loss_train.mean(), i)
 
@@ -931,7 +956,8 @@ class STAGE_TWO(Train_model):
                 top5_reacll_val = torch.cat((top5_reacll_val, top5_val))
             
             
-            if torch.distributed.get_rank() in [1]:
+            # if torch.distributed.get_rank() in [1]:
+            if True:
 
                 self.writer.add_scalar('top1_reacll_val', top1_reacll_val.mean(), i)
                 self.writer.add_scalar('top5_reacll_val', top5_reacll_val.mean(), i)

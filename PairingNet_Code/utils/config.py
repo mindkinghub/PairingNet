@@ -84,21 +84,23 @@ args.add_argument('--tranct_length', default=1408, type=int)
 # =========================
 
 # 数据集根目录
-DATA_ROOT = "./Fragments-dataset"
+DATA_ROOT = "../data/pkl"
 
 args.add_argument('--data_root', type=str, default=DATA_ROOT)
 
 args.add_argument('--train_set', type=str,
-                  default=os.path.join(DATA_ROOT, 'train_set_with_downsample.pkl'))
+                  default=os.path.join(DATA_ROOT, 'ori_train_set.pkl'))
 
 args.add_argument('--valid_set', type=str,
-                  default=os.path.join(DATA_ROOT, 'valid_set_with_downsample.pkl'))
+                  default=os.path.join(DATA_ROOT, 'ori_valid_set.pkl'))
 
 args.add_argument('--test_set', type=str,
-                  default=os.path.join(DATA_ROOT, 'test_set_with_downsample.pkl'))
+                  default=os.path.join(DATA_ROOT, 'ori_test_set.pkl'))
 
 args.add_argument('--search_set', type=str,
-                  default=os.path.join(DATA_ROOT, 'test_set_with_downsample.pkl'))
+                  default=os.path.join(DATA_ROOT, 'ori_test_set.pkl'))
+
+args.add_argument('--dataset_select', type=str, default='circle_sample_V5_2')
 
 # =========================
 # stage2 dataset
