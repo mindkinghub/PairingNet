@@ -5,6 +5,7 @@ import cv2
 import torch
 import math
 import random
+import time
 import pickle
 import multiprocessing
 multiprocessing.set_start_method('spawn', force=True)
@@ -80,8 +81,8 @@ class Train_model(object):
         self.train_loader = DataLoader(self.train_data, args.matching_batch_size, num_workers=0,shuffle=True)
 
         '''set test set in training model'''
-        self.valid_data, _ = self.set_dataset(args.valid_set, args)
-        self.valid_loader = DataLoader(self.valid_data, 1, num_workers=0, shuffle=False)
+        self.val_data, _ = self.set_dataset(args.valid_set, args)
+        self.val_loader = DataLoader(self.val_data, 1, num_workers=0, shuffle=False)
         
 
         '''set training model'''
@@ -101,33 +102,43 @@ class Train_model(object):
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=args.epoch)
         self.epoch = args.epoch
         self.args = args
+        self.best_loss = float('inf')
+        self.loss_fn = FocalLoss()
 
-    def save_checkpoint(self, epoch):
-        path = self.checkpoint_path + '/checkpoint_{}.tar'.format(epoch)
-        if not os.path.exists(path):
-            torch.save({  # 'state': torch.cuda.get_rng_state_all(),
-                'epoch': epoch,
-                'model_state_dict': self.models.state_dict(),
-                'optimizer_state_dict': self.optimizer.state_dict()}, path)
+    def save_checkpoint(self, epoch, val_loss=None):
+        state = {
+            'epoch': epoch,
+            'model_state_dict': self.models.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'best_loss': self.best_loss
+        }
+
+        # ===== latest（始终覆盖）=====
+        latest_path = os.path.join(self.checkpoint_path, "latest.tar")
+        torch.save(state, latest_path)
+
+        # ===== best（更优才保存）=====
+        if val_loss is not None and val_loss < self.best_loss:
+            self.best_loss = val_loss
+            best_path = os.path.join(self.checkpoint_path, "best.tar")
+            torch.save(state, best_path)
+            print(f"Save BEST model at epoch {epoch}, loss={val_loss:.4f}")
 
     def load_checkpoint(self):
-        checkpoints = glob(self.checkpoint_path + '/*')
-        if len(checkpoints) == 0:
-            print('No checkpoints found at {}'.format(self.checkpoint_path))
+        latest_path = os.path.join(self.checkpoint_path, "latest.tar")
+
+        if not os.path.exists(latest_path):
+            print(f'No checkpoint found at {self.checkpoint_path}')
             return 0
 
-        checkpoints = [os.path.splitext(os.path.basename(path))[0].split('_')[-1] for path in checkpoints]
-        checkpoints = np.array(checkpoints, dtype=float)
-        checkpoints = np.sort(checkpoints)
-        path = self.checkpoint_path + '/checkpoint_{}.tar'.format(int(checkpoints[-1]))
+        print(f'Loaded checkpoint from: {latest_path}')
+        checkpoint = torch.load(latest_path, map_location=self.device)
 
-        print('Loaded checkpoint from: {}'.format(path))
-        checkpoint = torch.load(path)
         self.models.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        epoch = checkpoint['epoch']
 
-        return epoch
+        start_epoch = checkpoint['epoch'] + 1
+        return start_epoch
 
     @staticmethod
     def get_pad_mask(mask_para):
@@ -136,7 +147,8 @@ class Train_model(object):
         padded mask denotes the padded part in similarity matrix which
         calculated by source and target point feature.
         """
-        bs, maxs, _ = mask_para[0].shape
+        bs = mask_para[0].shape[0]
+        maxs = mask_para[0].shape[1]
         pad_mask = torch.zeros((bs, maxs, maxs), dtype=torch.bool)
         for m in range(bs):
             a = mask_para[2][m]
@@ -192,68 +204,20 @@ class Train_model(object):
         device = self.device
         '''start training'''
         print('start!!!')
-        epoch = self.load_checkpoint()
-        # epoch = 0
-        min_loss = torch.inf
-        for i in range(self.epoch):
-            if i > self.epoch:
-                break
-            i += epoch
-            loss_m_all = torch.zeros([0])
-            v_loss_np_all = torch.zeros([0])
-            p_all = torch.zeros([0])
-            v_p_all = torch.zeros([0])
+        start_epoch = self.load_checkpoint()
+        for i in range(start_epoch, self.epoch):
+            loss_m_all=[]
+            p_all=[]
+            v_loss_np_all = []
+            v_p_all = []
             self.models.train()
             self.models.requires_grad_(True)
 
             for _, (mask_para, imgs, pcd, c_input, t_input, adjs, factors, att_mask) in enumerate(tqdm(self.train_loader)):
-                max_point_nums = len(pcd[0][0])
+                max_point_nums = pcd[0].shape[1]
                 adj_s = self.get_concat_adj(adjs[0], max_point_nums)
                 adj_t = self.get_concat_adj(adjs[1], max_point_nums)
                 # adj_s = adj_s.to(device)
-
-                source_input = {
-                    'pcd': pcd[0].to(device), 'img': imgs[0].to(device), 'c_input': c_input[0].to(device),
-                    'adj': adj_s.to(device), 'factor': factors[0].to(device), 't_input': t_input[0].to(device), "att_mask":adjs[0].to(device)
-                }
-
-                target_input = {
-                    'pcd': pcd[1].to(device), 'img': imgs[1].to(device), 'c_input': c_input[1].to(device),
-                    'adj': adj_t.to(device), 'factor': factors[1].to(device), 't_input': t_input[1].to(device), "att_mask":adjs[1].to(device)
-                }
-
-
-                pad_mask = self.get_pad_mask(mask_para).to(device)  # mark the padded part in similarity matrix
-                gt_mask = mask_para[0].to(device)  # mark the gt corresponding in similarity matrix
-
-                feature_s, _, w_s = self.models(source_input) # 15,2778,64
-                feature_t, _, w_t = self.models(target_input)
-                similarity_matrix = self.get_similarity_matrix(feature_s, feature_t, pad_mask) #bs, n, n
-                '''matching loss'''
-                loss_fn = FocalLoss()
-                pad_mask = torch.add(pad_mask, gt_mask)  # padded mask with gt label.
-                loss_np, loss_p = loss_fn(similarity_matrix, gt_mask, pad_mask)
-
-
-                self.optimizer.zero_grad()
-                loss_np.backward()
-                self.optimizer.step()
-                loss_m_all = torch.cat((loss_m_all, loss_np.detach().cpu().view(-1)))
-                p_all = torch.cat((p_all, loss_p.cpu().view(-1)))
-
-            self.scheduler.step()
-            self.writer.add_scalar('train_loss', loss_m_all.mean(), i)
-
-            if (i + 1) % 2 != 0:
-                continue
-
-            '''validation'''
-            self.models.eval()
-            self.models.requires_grad_(False)
-            for _, (mask_para, imgs, pcd, c_input, t_input, adjs, factors, att_mask) in enumerate(tqdm(self.valid_loader)):
-                max_point_nums = len(pcd[0][0])
-                adj_s = self.get_concat_adj(adjs[0], max_point_nums)
-                adj_t = self.get_concat_adj(adjs[1], max_point_nums)
 
                 source_input = {
                     'pcd': pcd[0].to(device), 'img': imgs[0].to(device), 'c_input': c_input[0].to(device),
@@ -265,33 +229,72 @@ class Train_model(object):
                     'adj': adj_t.to(device), 'factor': factors[1].to(device), 't_input': t_input[1].to(device), "att_mask":att_mask[1].to(device)
                 }
 
-                pad_mask = self.get_pad_mask(mask_para).to(device)
-                gt_mask = mask_para[0].to(device)
-                feature_s, _, w_s = self.models(source_input)
+
+                pad_mask = self.get_pad_mask(mask_para).to(device)  # mark the padded part in similarity matrix
+                gt_mask = mask_para[0].to(device)  # mark the gt corresponding in similarity matrix
+                final_mask = pad_mask | gt_mask
+
+                feature_s, _, w_s = self.models(source_input) # 15,2778,64
                 feature_t, _, w_t = self.models(target_input)
-                similarity_matrix = self.get_similarity_matrix(feature_s, feature_t, pad_mask)
+                similarity_matrix = self.get_similarity_matrix(feature_s, feature_t, pad_mask) #bs, n, n
                 '''matching loss'''
-                loss_fn = FocalLoss()
-                pad_mask = torch.add(pad_mask, gt_mask)  # padded mask with gt label.
-                v_loss_np, v_loss_p = loss_fn(similarity_matrix, gt_mask, pad_mask)
+                loss_np, loss_p = self.loss_fn(similarity_matrix, gt_mask, final_mask)
 
-                v_loss_np_all = torch.cat((v_loss_np_all, v_loss_np.cpu().view(-1)))
-                v_p_all = torch.cat((v_p_all, v_loss_p.cpu().view(-1)))
 
-            self.writer.add_scalar('valid_loss', v_loss_np_all.mean(), i)
-            self.writer.add_scalar('valid_positive_loss', v_p_all.mean(), i)
-            means_all = v_p_all.mean()
-            # self.save_checkpoint(i)
-            if means_all < min_loss:
-                for path in glob(EXP_path+'/EXP/{}'.format(self.case_name) + '/val_min=*'):
-                    os.remove(path)
-                min_loss = means_all.clone()
-                np.save(EXP_path+'/EXP/{}'.format(self.case_name) + '/val_min={}-{}'.format(i, min_loss), [i, min_loss])
-                self.save_checkpoint(i)
-                # torch.save(models.state_dict(), weight_save_path[:-4]+'({})'.format(round(float(min_loss), 2))+'.pth')
+                self.optimizer.zero_grad()
+                loss_np.backward()
+                self.optimizer.step()
+                loss_m_all.append(loss_np.item())
+                p_all.append(loss_p.item())
+            train_loss=np.mean(loss_m_all)
+            self.scheduler.step()
+            self.writer.add_scalar('train_loss', train_loss, i)
 
+            if (i + 1) % 2 != 0:
+                continue
+
+            '''validation'''
+            self.models.eval()
+            self.models.requires_grad_(False)
+            with torch.no_grad():
+                for _, (mask_para, imgs, pcd, c_input, t_input, adjs, factors, att_mask) in enumerate(tqdm(self.val_loader)):
+                    max_point_nums = pcd[0].shape[1]
+                    adj_s = self.get_concat_adj(adjs[0], max_point_nums)
+                    adj_t = self.get_concat_adj(adjs[1], max_point_nums)
+
+                    source_input = {
+                        'pcd': pcd[0].to(device), 'img': imgs[0].to(device), 'c_input': c_input[0].to(device),
+                        'adj': adj_s.to(device), 'factor': factors[0].to(device), 't_input': t_input[0].to(device), "att_mask":att_mask[0].to(device)
+                    }
+
+                    target_input = {
+                        'pcd': pcd[1].to(device), 'img': imgs[1].to(device), 'c_input': c_input[1].to(device),
+                        'adj': adj_t.to(device), 'factor': factors[1].to(device), 't_input': t_input[1].to(device), "att_mask":att_mask[1].to(device)
+                    }
+
+                    pad_mask = self.get_pad_mask(mask_para).to(device)
+                    gt_mask = mask_para[0].to(device)
+                    final_mask = pad_mask | gt_mask
+
+                    feature_s, _, w_s = self.models(source_input)
+                    feature_t, _, w_t = self.models(target_input)
+                    similarity_matrix = self.get_similarity_matrix(feature_s, feature_t, pad_mask)
+                    '''matching loss'''
+                    v_loss_np, v_loss_p = self.loss_fn(similarity_matrix, gt_mask, final_mask)
+
+                    v_loss_np_all.append(v_loss_np.item())
+                    v_p_all.append(v_loss_p.item())
+
+            # ===== 记录验证指标 =====
+            val_loss = sum(v_loss_np_all) / len(v_loss_np_all)
+            val_pos_loss = sum(v_p_all) / len(v_p_all)
+
+            self.writer.add_scalar('valid_loss', val_loss, i)
+            self.writer.add_scalar('valid_positive_loss', val_pos_loss, i)
+            self.save_checkpoint(i, val_loss)
+           
             print('epoch = {}, match_loss = {}, loss_p = {}, v_match_loss = {}, v_loss_p = {}'.format(
-                i, loss_m_all.mean(), p_all.mean(), v_loss_np_all.mean(), v_p_all.mean(),
+                i, np.mean(loss_m_all), np.mean(p_all), val_loss, val_pos_loss
             ))
 
 
@@ -302,9 +305,9 @@ class TestModel(Train_model):
         self.save_corres = save_corres
         self.save_w = save_w
         self.save_gt = save_gt
-        checkpoint_path = EXP_path+'/EXP/{}/checkpoint/'.format(case_name)
-        best_checkpoint = self.get_max_file_number(checkpoint_path)
-        self.checkpoint_path_evl = EXP_path+'/EXP/{}/checkpoint/{}'.format(case_name, best_checkpoint)
+        self.checkpoint_path = EXP_path + '/EXP/{}/checkpoint'.format(case_name)
+        self.best_checkpoint = os.path.join(self.checkpoint_path, "best.tar")
+        self.latest_checkpoint = os.path.join(self.checkpoint_path, "latest.tar")
         self.case_name = case_name
         '''set testing dataset'''
         print('set testing dataset')
@@ -325,9 +328,15 @@ class TestModel(Train_model):
         self.args = args
 
     def load_checkpoint_evl(self):
-        checkpoint = torch.load(self.checkpoint_path_evl)
+        path = self.best_checkpoint if os.path.exists(self.best_checkpoint) else self.latest_checkpoint
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"No checkpoint found in {self.checkpoint_path}")
+
+        print(f"Loading checkpoint: {path}")
+        checkpoint = torch.load(path, map_location=self.device)
+
         self.models.load_state_dict(checkpoint['model_state_dict'])
-        return
+        return path
     
     def get_max_file_number(self, directory):
         max_number = -1
@@ -351,6 +360,11 @@ class TestModel(Train_model):
         
         return area
     
+    def safe_get_concat_adj(self, adj, max_len):
+        if adj.dim()==2 and adj.shape[0]==2:
+            return adj  # already global graph
+
+        return self.get_concat_adj(adj, max_len)
     def cosine_similarity(self, vec1, vec2):
         # Compute the dot product of two vectors
         dot_product = np.sum(vec1 * vec2, axis=1)
@@ -360,6 +374,12 @@ class TestModel(Train_model):
         # Calculate cosine similarity
         cosine_similarity = dot_product / (norm_vec1 * norm_vec2)
         return cosine_similarity
+    
+    def safe_get_pad_mask(self, mask_para):
+        if isinstance(mask_para, torch.Tensor):
+            return mask_para.to(self.device)
+
+        return self.get_pad_mask(mask_para)
     
     def calculate_ratio(self, mixed_feature, vec_c, vec_t):
         # Calculate the sum of two vectors
@@ -379,9 +399,10 @@ class TestModel(Train_model):
         valid_nums2 = 0
         valid_nums6 = 0
         c = 0 
-        w_min = 100
         w_count = 0
         haus_list = [] 
+        all_w_s = []
+        all_w_t = []
 
         '''test start'''
         print('test start!')
@@ -389,122 +410,142 @@ class TestModel(Train_model):
             "pred_transformation":[],
             "GT_transformation":[],
         }
-        saved_test_weight = []
-        for batch, (mask_para, imgs, pcd, c_input, t_input, adjs, factors, att_mask) in enumerate(tqdm(self.test_loader)):
-            max_point_nums = len(pcd[0][0])
-            adj_s = self.get_concat_adj(adjs[0], max_point_nums)
-            adj_t = self.get_concat_adj(adjs[1], max_point_nums)
+        with torch.no_grad():
+            for batch, (mask_para, imgs, pcd, c_input, t_input, adjs, factors, att_mask) in enumerate(tqdm(self.test_loader)):
+                max_point_nums = pcd[0].shape[1]
+                adj_s = self.safe_get_concat_adj(adjs[0], max_point_nums)
+                adj_t = self.safe_get_concat_adj(adjs[1], max_point_nums)
 
-            source_input = {
-                'pcd': pcd[0].to(device), 'img': imgs[0].to(device), 'c_input': c_input[0].to(device),
-                'adj': adj_s.to(device), 'factor': factors[0].to(device), 't_input': t_input[0].to(device), "att_mask":att_mask[0].to(device)
-            }
+                source_input = {
+                    'pcd': pcd[0].to(device), 'img': imgs[0].to(device), 'c_input': c_input[0].to(device),
+                    'adj': adj_s.to(device), 'factor': factors[0].to(device), 't_input': t_input[0].to(device), "att_mask":att_mask[0].to(device)
+                }
 
-            target_input = {
-                'pcd': pcd[1].to(device), 'img': imgs[1].to(device), 'c_input': c_input[1].to(device),
-                'adj': adj_t.to(device), 'factor': factors[1].to(device), 't_input': t_input[1].to(device), "att_mask":att_mask[1].to(device)
-            }
+                target_input = {
+                    'pcd': pcd[1].to(device), 'img': imgs[1].to(device), 'c_input': c_input[1].to(device),
+                    'adj': adj_t.to(device), 'factor': factors[1].to(device), 't_input': t_input[1].to(device), "att_mask":att_mask[1].to(device)
+                }
 
-            pad_mask = self.get_pad_mask(mask_para).to(device)  # mark the padded part in similarity matrix
-            mask = mask_para[0].to(device)
-            feature_s, concat_source, w_s = self.models(source_input)
-            feature_t, concat_target, w_t = self.models(target_input)
-            similarity_matrix = self.get_similarity_matrix(feature_s, feature_t, pad_mask)
+                pad_mask = self.safe_get_pad_mask(mask_para).to(device)  # mark the padded part in similarity matrix
+                mask = mask_para[0].to(device)
+                feature_s, concat_source, w_s = self.models(source_input)
+                feature_t, concat_target, w_t = self.models(target_input)
+                similarity_matrix = self.get_similarity_matrix(feature_s, feature_t, pad_mask)
 
-            w1 = w_s.clone().detach()
-            w11 = w1.cpu().numpy()
-            w2 = w_t.clone().detach()
-            w22 = w2.cpu().numpy()
-            saved_test_weight.append([w11,w22])
+                w1 = w_s.detach().cpu().numpy()
+                w2 = w_t.detach().cpu().numpy()
+                all_w_s.append(w1.reshape(-1))
+                all_w_t.append(w2.reshape(-1))
 
-            '''visualization part'''
-            gt_matrix = mask[0].to_dense().float().cpu().numpy()
-            similarity_matrix = similarity_matrix[0].cpu().numpy()
-            kernel = np.eye(3, dtype=np.uint8)
-            kernel[1, 1] = 0
-            kernel = np.rot90(kernel)
-            similarity_matrix = cv2.erode(similarity_matrix, kernel, borderType=cv2.BORDER_CONSTANT, borderValue=0)
-            kernel[1, 1] = 1
-            similarity_matrix = cv2.dilate(similarity_matrix, kernel, borderType=cv2.BORDER_CONSTANT, borderValue=0)
+                '''visualization part'''
+                if hasattr(mask[0], "to_dense"):
+                    gt_matrix = mask[0].to_dense().float().cpu().numpy()
+                else:
+                    gt_matrix = mask[0].float().cpu().numpy()
+                similarity_matrix=similarity_matrix[0].detach().cpu().numpy()
+                kernel = np.eye(3, dtype=np.uint8)
+                kernel[1, 1] = 0
+                kernel = np.rot90(kernel)
+                similarity_matrix = cv2.erode(similarity_matrix, kernel, borderType=cv2.BORDER_CONSTANT, borderValue=0)
+                kernel[1, 1] = 1
+                similarity_matrix = cv2.dilate(similarity_matrix, kernel, borderType=cv2.BORDER_CONSTANT, borderValue=0)
 
-            idx_s, idx_t = gt_pairs[c]
-            s_pcd_origin, t_pcd_origin = self.test_set['full_pcd_all'][idx_s], self.test_set['full_pcd_all'][idx_t]
+                idx_s, idx_t = gt_pairs[batch]
+                s_pcd_origin, t_pcd_origin = self.test_set['full_pcd_all'][idx_s], self.test_set['full_pcd_all'][idx_t]
 
-            s_pcd, t_pcd = self.test_set['full_pcd_all'][idx_s], self.test_set['full_pcd_all'][idx_t]
-            ind_s_origin, ind_t_origin = self.test_set['source_ind'][batch], self.test_set['target_ind'][batch]
-            source_img, target_img = self.test_set['img_all'][idx_s], self.test_set['img_all'][idx_t]
-            img_save_path = EXP_path+'/EXP/{}/result/img'.format(self.case_name)
-            corres_save_path = EXP_path+'/EXP/{}/result/corres'.format(self.case_name)
-            os.makedirs(img_save_path, exist_ok=True)
-            os.makedirs(corres_save_path, exist_ok=True)
-            evl = visualization.Visualization(gt_matrix, similarity_matrix, s_pcd, t_pcd, source_img,
-                                              target_img, ind_s_origin, ind_t_origin, s_pcd_origin, t_pcd_origin, conv_threshold=0.006) # 0.006改成0.0006-》RANSAC很慢，改成0.06试试-》效果不好
+                s_pcd, t_pcd = self.test_set['full_pcd_all'][idx_s], self.test_set['full_pcd_all'][idx_t]
+                ind_s_origin, ind_t_origin = self.test_set['source_ind'][batch], self.test_set['target_ind'][batch]
+                source_img, target_img = self.test_set['img_all'][idx_s], self.test_set['img_all'][idx_t]
+                result_dir=EXP_path+'/EXP/{}/result'.format(self.case_name)
+                os.makedirs(result_dir,exist_ok=True)
+                img_save_path = EXP_path+'/EXP/{}/result/img'.format(self.case_name)
+                corres_save_path = EXP_path+'/EXP/{}/result/corres'.format(self.case_name)
+                os.makedirs(img_save_path, exist_ok=True)
+                os.makedirs(corres_save_path, exist_ok=True)
+                evl = visualization.Visualization(gt_matrix, similarity_matrix, s_pcd, t_pcd, source_img,
+                                                target_img, ind_s_origin, ind_t_origin, s_pcd_origin, t_pcd_origin, conv_threshold=0.006) # 0.006改成0.0006-》RANSAC很慢，改成0.06试试-》效果不好
 
-            transformation, pairs = evl.get_transformation()
+                transformation, pairs = evl.get_transformation()
 
-
-
-        
-            if self.save_w:
-                img_s = source_img.transpose(1, 0, 2)
-                img_s = np.ascontiguousarray(img_s)
-                evl.img_s = evl.weight_visualize(os.path.join(img_save_path, 'w_s{}.png'.format(c)),
-                                                 img_s, s_pcd, w_s[0].detach().cpu().numpy())
-
-
-                img_t = target_img.transpose(1, 0, 2)
-                img_t = np.ascontiguousarray(img_t)
-                evl.img_t = evl.weight_visualize(os.path.join(img_save_path, 'w_t{}.png'.format(c)),
-                                                 img_t, t_pcd, w_t[0].detach().cpu().numpy())
-
-            if self.save_img:
-                evl.get_img(os.path.join(img_save_path, 'pred{}.png'.format(c)), transformation)
-
-            # save ground truth result pairs
-            if self.save_gt:
-                evl.get_gt_img(os.path.join(img_save_path, 'gt{}.png'.format(c)))
-
-            # save result pairs with corresponding points connected.
-            if self.save_corres:
-                evl.get_corresponding(os.path.join(corres_save_path, 'corres{}.png'.format(c)))
-
-            # evaluation part
-            if transformation is None:
-                haus_list.append(0.)
-                transformation = np.array([[1,0,0,0],[0,1,0,0],[0,0,0,0]])
+                if self.save_w:
+                    img_s = source_img.transpose(1, 0, 2)
+                    img_s = np.ascontiguousarray(img_s)
+                    evl.img_s = evl.weight_visualize(os.path.join(img_save_path, 'w_s{}.png'.format(c)),
+                                                    img_s, s_pcd, w1[0])
 
 
-            intersection_s = evl.pcd_s_inter_gt_origin
-            intersection_s_trans = affine_transform(intersection_s, np.delete(transformation[:2], 2, axis=-1))
-            intersection_t = evl.pcd_t_inter_gt_origin
+                    img_t = target_img.transpose(1, 0, 2)
+                    img_t = np.ascontiguousarray(img_t)
+                    evl.img_t = evl.weight_visualize(os.path.join(img_save_path, 'w_t{}.png'.format(c)),
+                                                    img_t, t_pcd, w2[0])
 
-            haus_dist = hausdorff_distance(intersection_s_trans, intersection_t, distance='euclidean')
-            haus_list.append(haus_dist) 
+                if self.save_img:
+                    evl.get_img(os.path.join(img_save_path, 'pred{}.png'.format(c)), transformation)
 
-            GT_transformation = evl.GT_transformation
+                # save ground truth result pairs
+                if self.save_gt:
+                    evl.get_gt_img(os.path.join(img_save_path, 'gt{}.png'.format(c)))
 
-            saved_test_data["pred_transformation"].append(np.delete(transformation[:2], 2, axis=-1))
-            saved_test_data["GT_transformation"].append(GT_transformation)
+                # save result pairs with corresponding points connected.
+                if self.save_corres:
+                    evl.get_corresponding(os.path.join(corres_save_path, 'corres{}.png'.format(c)))
+
+                # evaluation part
+                if transformation is None:
+                    haus_list.append(0.)
+                    transformation = np.array([[1,0,0,0],[0,1,0,0],[0,0,0,0]])
 
 
+                intersection_s = evl.pcd_s_inter_gt_origin
+                intersection_s_trans = affine_transform(intersection_s, np.delete(transformation[:2], 2, axis=-1))
+                intersection_t = evl.pcd_t_inter_gt_origin
 
-            ermes = e_rmse(intersection_s_trans, intersection_t) 
-            if ermes < 2:
-                valid_nums2 += 1
-            elif ermes < 4:
-                valid_nums4 += 1
-            elif ermes < 6:
-                valid_nums6 += 1
-            else:
-                pass
-            c += 1
+                haus_dist = hausdorff_distance(intersection_s_trans, intersection_t, distance='euclidean')
+                haus_list.append(haus_dist) 
+
+                GT_transformation = evl.GT_transformation
+
+                saved_test_data["pred_transformation"].append(np.delete(transformation[:2], 2, axis=-1))
+                saved_test_data["GT_transformation"].append(GT_transformation)
+
+                ermes = e_rmse(intersection_s_trans, intersection_t) 
+                if ermes < 2:
+                    valid_nums2 += 1
+                elif ermes < 4:
+                    valid_nums4 += 1
+                elif ermes < 6:
+                    valid_nums6 += 1
+                else:
+                    pass
+                c += 1
+
+        all_w_s = np.concatenate(all_w_s, axis=0)
+        all_w_t = np.concatenate(all_w_t, axis=0)
+        print("==== Weight Statistics ====")
+        print("[Source Weight]")
+        print("mean:", all_w_s.mean())
+        print("std :", all_w_s.std())
+        print("min :", all_w_s.min())
+        print("max :", all_w_s.max())
+
+        print("[Target Weight]")
+        print("mean:", all_w_t.mean())
+        print("std :", all_w_t.std())
+        print("min :", all_w_t.min())
+        print("max :", all_w_t.max())
+        w_s_sigmoid = 1 / (1 + np.exp(-all_w_s))
+        w_t_sigmoid = 1 / (1 + np.exp(-all_w_t))
+        print("==== Normalized Analysis ====")
+
+        print("[Sigmoid]")
+        print("mean:", w_s_sigmoid.mean(), w_t_sigmoid.mean())
+
 
         with open(EXP_path+'/EXP/{}/result/saved_test_exp_data.pkl'.format(self.case_name), 'wb') as file:
             pickle.dump(saved_test_data, file)
 
-        print(w_count)
         registration_recall = (
-        valid_nums2 / len(gt_pairs), valid_nums4 / len(gt_pairs), valid_nums6 / len(gt_pairs), float(w_min))
+        valid_nums2 / len(gt_pairs), valid_nums4 / len(gt_pairs), valid_nums6 / len(gt_pairs))
         with open(EXP_path+'/EXP/{}/result/registration recall.txt'.format(self.case_name), 'w') as f:
             f.write('{}'.format(registration_recall))
 
@@ -519,9 +560,10 @@ class STAGE_ONE(Train_model):
         self.save_corres = save_corres
         self.save_w = save_w
         self.save_gt = save_gt
-        checkpoint_path = EXP_path+'/EXP/{}/checkpoint/'.format(case_name)
-        best_checkpoint = self.get_max_file_number(checkpoint_path)
-        self.checkpoint_path_evl = EXP_path+'/EXP/{}/checkpoint/{}'.format(case_name, best_checkpoint)
+        checkpoint_path = os.path.join(EXP_path, 'EXP', case_name, 'checkpoint')
+        self.best_checkpoint = os.path.join(checkpoint_path,"best.tar")
+        self.latest_checkpoint=os.path.join(checkpoint_path,"latest.tar")
+        self.checkpoint_path_evl = self.best_checkpoint
         self.case_name = case_name
         if os.path.exists(EXP_path+'/EXP2/{}'.format(case_name)) is False:
             os.makedirs(EXP_path+'/EXP2/{}'.format(case_name))
@@ -543,15 +585,9 @@ class STAGE_ONE(Train_model):
 
         '''set val dataset'''
         print('set testing dataset')
-        self.valid_data, self.val_GT = self.set_dataset(args.valid_set, args)
-        self.valid_loader = DataLoader(self.valid_data, 1, num_workers=0, shuffle=False)
+        self.val_data, self.val_GT = self.set_dataset(args.valid_set, args)
+        self.val_loader = DataLoader(self.val_data, 1, num_workers=0, shuffle=False)
         self.val_gt_pairs = self.val_GT['GT_pairs']
-        self.val_pcd = self.val_GT['full_pcd_all']
-        self.s_index_val = self.val_GT['source_ind']
-        self.t_index_val = self.val_GT['target_ind']
-        
-        '''set test dataset'''
-        print('set testing dataset')
         self.test_data, self.test_GT = self.set_dataset(args.test_set, args)
         self.test_loader = DataLoader(self.test_data, 1, num_workers=0, shuffle=False)
         self.test_gt_pairs = self.test_GT['GT_pairs']
@@ -565,11 +601,12 @@ class STAGE_ONE(Train_model):
         self.temperature = temperature
 
         args.flattenNet_config['input_dim'] = args.patch_size ** 2
-        self.models = net(args)
-        self.models.to(self.device)
-        self.models.eval()
-        self.models.requires_grad_(False)
+        self.models = net(args).to(self.device)
         self.args = args
+
+        self.val_pcd = self.val_GT['full_pcd_all']
+        self.s_index_val = self.val_GT['source_ind']
+        self.t_index_val = self.val_GT['target_ind']
 
     #     self.saved_feature = {
     #     'train_feature': [],
@@ -579,10 +616,17 @@ class STAGE_ONE(Train_model):
     #    
 
     def load_checkpoint_evl(self):
-        checkpoint = torch.load(self.checkpoint_path_evl)
+
+        if os.path.exists(self.best_checkpoint):
+            path = self.best_checkpoint
+        elif os.path.exists(self.latest_checkpoint):
+            path = self.latest_checkpoint
+        else:
+            raise FileNotFoundError("No checkpoint found")
+
+        checkpoint = torch.load(path, map_location=self.device)
         self.models.load_state_dict(checkpoint['model_state_dict'])
-        return
-    
+        
     def get_max_file_number(self, directory):
         max_number = -1
         max_file = None
@@ -598,31 +642,30 @@ class STAGE_ONE(Train_model):
 
     def stage1_start(self):
         self.load_checkpoint_evl()
+        self.models.eval()
+        self.models.requires_grad_(False)
         device = self.device
         '''save train feature'''
         train_saved_feature = {
             "saved_feature": [],
-            "GT_pairs":self.train_gt_pairs,
-            "full_pcd":self.train_pcd,
-            "source_ind":self.s_index_train,
-            "target_ind":self.t_index_train
+            "GT_pairs": self.train_gt_pairs,
+            "full_pcd": self.train_pcd,
+            "source_ind": self.s_index_train,
+            "target_ind": self.t_index_train
         }
-        for batch, (pcd, imgs, t_input, adj, factor, c_input) in enumerate(tqdm(self.train_loader)):
-            max_point_nums = len(pcd[0])
-            # origin_adj = adj.clone()
-            adj = self.get_concat_adj(adj, max_point_nums)
-            inputs = {
-                'pcd': pcd.to(device), 'img': imgs.to(device), 't_input': t_input.to(device),
-                'adj': adj.to(device), 'factor': factor.to(device), 'c_input': c_input.to(device)
-            }
+        with torch.no_grad():
+            for batch, (pcd, imgs, t_input, adj, factor, c_input) in enumerate(tqdm(self.train_loader)):
+                max_point_nums = pcd.shape[1]
+                adj = self.get_concat_adj(adj, max_point_nums)
+                inputs = {
+                    'pcd': pcd.to(device), 'img': imgs.to(device), 't_input': t_input.to(device),
+                    'adj': adj.to(device), 'factor': factor.to(device), 'c_input': c_input.to(device)
+                }
 
-            matching_feature, feature, _ = self.models(inputs) # bs,2611,64
-            if self.args.stage2_data_model == "merged":
-                train_saved_feature["saved_feature"].append(matching_feature.squeeze().cpu())
-            else:
-                train_saved_feature["saved_feature"].append(feature.squeeze().cpu())
-            
-            # train_saved_feature["adj"].append(origin_adj[0])
+                matching_feature, feature, _ = self.models(inputs) # bs,2611,64
+                feat = matching_feature if self.args.stage2_data_model == "merged" else feature
+                train_saved_feature["saved_feature"].append(feat.squeeze(0).detach().cpu())
+                # train_saved_feature["adj"].append(origin_adj[0])
         
         with open(self.saved_train_feature_path, 'wb') as file:
             pickle.dump(train_saved_feature, file)
@@ -630,26 +673,24 @@ class STAGE_ONE(Train_model):
         '''save val feature'''
         val_saved_feature = {
             "saved_feature": [],
-            "GT_pairs":self.val_gt_pairs,
-            "full_pcd":self.val_pcd,
-            "source_ind":self.s_index_val,
-            "target_ind":self.t_index_val
+            "GT_pairs": self.val_gt_pairs,
+            "full_pcd": self.val_pcd,
+            "source_ind": self.s_index_val,
+            "target_ind": self.t_index_val
         }
-        for batch, (pcd, imgs, t_input, adj, factor, c_input) in enumerate(tqdm(self.valid_loader)):
-            max_point_nums = len(pcd[0])
-            # origin_adj = adj.clone()
-            adj = self.get_concat_adj(adj, max_point_nums)
-            inputs = {
-                'pcd': pcd.to(device), 'img': imgs.to(device), 't_input': t_input.to(device),
-                'adj': adj.to(device), 'factor': factor.to(device), 'c_input': c_input.to(device)
-            }
+        with torch.no_grad():
+            for batch, (pcd, imgs, t_input, adj, factor, c_input) in enumerate(tqdm(self.val_loader)):
+                max_point_nums = pcd.shape[1]
+                adj = self.get_concat_adj(adj, max_point_nums)
+                inputs = {
+                    'pcd': pcd.to(device), 'img': imgs.to(device), 't_input': t_input.to(device),
+                    'adj': adj.to(device), 'factor': factor.to(device), 'c_input': c_input.to(device)
+                }
 
-            matching_feature, feature, _ = self.models(inputs) # bs,2611,64
-            if self.args.stage2_data_model == "merged":
-                val_saved_feature["saved_feature"].append(matching_feature.squeeze().cpu())
-            else:
-                val_saved_feature["saved_feature"].append(feature.squeeze().cpu())
-            # val_saved_feature["adj"].append(origin_adj[0])
+                matching_feature, feature, _ = self.models(inputs) # bs,2611,64
+                feat = matching_feature if self.args.stage2_data_model == "merged" else feature
+                val_saved_feature["saved_feature"].append(feat.squeeze(0).detach().cpu())
+                # val_saved_feature["adj"].append(origin_adj[0])
 
         with open(self.saved_val_feature_path, 'wb') as file:
             pickle.dump(val_saved_feature, file)
@@ -657,33 +698,29 @@ class STAGE_ONE(Train_model):
         '''save test feature'''
         test_saved_feature = {
             "saved_feature": [],
-            "GT_pairs":self.test_gt_pairs,
-            "full_pcd":self.test_pcd,
-            "source_ind":self.s_index_test,
-            "target_ind":self.t_index_test
+            "GT_pairs": self.test_gt_pairs,
+            "full_pcd": self.test_pcd,
+            "source_ind": self.s_index_test,
+            "target_ind": self.t_index_test
         }
-        for batch, (pcd, imgs, t_input, adj, factor, c_input) in enumerate(tqdm(self.test_loader)):
-            max_point_nums = len(pcd[0])
-            # origin_adj = adj.clone()
-            adj = self.get_concat_adj(adj, max_point_nums)
-            inputs = {
-                'pcd': pcd.to(device), 'img': imgs.to(device), 't_input': t_input.to(device),
-                'adj': adj.to(device), 'factor': factor.to(device), 'c_input': c_input.to(device)
-            }
+        with torch.no_grad():
+            for batch, (pcd, imgs, t_input, adj, factor, c_input) in enumerate(tqdm(self.test_loader)):
+                max_point_nums = pcd.shape[1]
+                adj = self.get_concat_adj(adj, max_point_nums)
+                inputs = {
+                    'pcd': pcd.to(device), 'img': imgs.to(device), 't_input': t_input.to(device),
+                    'adj': adj.to(device), 'factor': factor.to(device), 'c_input': c_input.to(device)
+                }
 
-            matching_feature, feature, _ = self.models(inputs) # bs,2611,64
-
-            if self.args.stage2_data_model == "merged":
-                test_saved_feature["saved_feature"].append(matching_feature.squeeze().cpu())
-            else:
-                test_saved_feature["saved_feature"].append(feature.squeeze().cpu())
-            # test_saved_feature["adj"].append(origin_adj[0])
+                matching_feature, feature, _ = self.models(inputs) # bs,2611,64
+                feat = matching_feature if self.args.stage2_data_model == "merged" else feature
+                test_saved_feature["saved_feature"].append(feat.squeeze(0).detach().cpu())
+                # test_saved_feature["adj"].append(origin_adj[0])
 
         with open(self.saved_test_feature_path, 'wb') as file:
             pickle.dump(test_saved_feature, file)
         
-        print("Stage 1 over")
-        
+        print("Stage 1 over")    
 
 class STAGE_TWO(Train_model):
     def __init__(self, net, args, temperature, case_name, save_img=False, save_corres=False, save_w=False,
@@ -757,6 +794,7 @@ class STAGE_TWO(Train_model):
                                           lr=args.stage2_lr,
                                           weight_decay=args.stage2_weight_decay)
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=args.stage2_epoch)
+        self.best_loss=float('inf')
 
     def find_feature(self, path, pattern):
         files = glob(os.path.join(path, pattern))
@@ -777,15 +815,41 @@ class STAGE_TWO(Train_model):
         # gt_config['patch_size'] = args.patch_size
         dataset = data_preprocess.MyDataSet_searching(stage1_features, args)
         return dataset, None
-    def save_checkpoint(self, epoch):
-        path = self.checkpoint_path + '/stageTwo_model_{}.tar'.format(epoch)
-        if not os.path.exists(path):
-            torch.save({  # 'state': torch.cuda.get_rng_state_all(),
-                'epoch': epoch,
-                # 'model_state_dict': self.models.module.state_dict(),
-                'model_state_dict': self.models.state_dict(),
-                'optimizer_state_dict': self.optimizer.state_dict()}, path)
-    
+    def save_checkpoint(self, epoch, val_loss=None):
+        state = {
+            'epoch': epoch,
+            'model_state_dict': self.models.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'best_loss': getattr(self, 'best_loss', float('inf'))
+        }
+
+        # ===== latest =====
+        torch.save(state, os.path.join(self.checkpoint_path, "latest.tar"))
+
+        # ===== best =====
+        if val_loss is not None and val_loss < self.best_loss:
+            self.best_loss = val_loss
+            torch.save(state, os.path.join(self.checkpoint_path, "best.tar"))
+            print(f"[Stage2] Save BEST model at epoch {epoch}, loss={val_loss:.4f}")
+        
+    def load_checkpoint(self):
+        latest_path = os.path.join(self.checkpoint_path, "latest.tar")
+
+        if not os.path.exists(latest_path):
+            print(f'[Stage2] No checkpoint found at {self.checkpoint_path}')
+            self.best_loss = float('inf')
+            return 0
+
+        print(f'[Stage2] Loaded checkpoint from: {latest_path}')
+        checkpoint=torch.load(latest_path,map_location=self.device)
+
+        self.models.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+        self.best_loss = checkpoint.get('best_loss', float('inf'))
+
+        return checkpoint['epoch'] + 1
+
     def get_max_file_number(self, directory):
         max_number = -1
         max_file = None
@@ -857,24 +921,18 @@ class STAGE_TWO(Train_model):
     def train_start(self):
         
         print('Stage 2 training start!!!')
-        infor_loss_train = torch.zeros([0])
-        infor_loss_val = torch.zeros([0])
+        infor_loss_train=[]
+        infor_loss_val = []
 
-        top1_reacll_train = torch.zeros([0])
-        top5_reacll_train = torch.zeros([0])
-        top1_reacll_val = torch.zeros([0])
-        top5_reacll_val = torch.zeros([0])
+        start_epoch = self.load_checkpoint()
+        InfoNCE_loss = InfoNCE(temperature=self.contrast_temperature)
 
-        loss_m_all = torch.zeros([0])
-        v_loss_np_all = torch.zeros([0])
-        p_all = torch.zeros([0])
-        v_p_all = torch.zeros([0])
+        for i in range(start_epoch, self.epoch):
 
-        min_loss = torch.inf
-        for i in range(self.epoch):
+            infor_loss_train = []
+            infor_loss_val = []
 
             self.models.train()
-            self.models.requires_grad_(True)
 
             for e, (stage1_features) in enumerate(tqdm(self.train_loader)):
                 # self.train_sampler.set_epoch(e)
@@ -882,103 +940,60 @@ class STAGE_TWO(Train_model):
                 stage1_features_s, stage1_features_t, index_s, index_t, pcd_s, pcd_t = all_data
                 stage1_features_s, stage1_features_t, pcd_s, pcd_t = stage1_features_s.to(self.device), stage1_features_t.to(self.device), pcd_s.to(self.device), pcd_t.to(self.device)
 
-
                 feature_s, _ = self.models(stage1_features_s, pcd_s)
                 feature_t, _ = self.models(stage1_features_t, pcd_t)
-
+                feature_s = F.normalize(feature_s, p=2, dim=1)
+                feature_t = F.normalize(feature_t, p=2, dim=1)
                 
                 '''searching loss'''
-                InfoNCE_loss = InfoNCE(temperature=self.contrast_temperature)
-                infor_loss = InfoNCE_loss(feature_s, feature_t, gt_pairs=(index_s, index_t))
+                loss_s2t = InfoNCE_loss(feature_s, feature_t, gt_pairs=(index_s, index_t))
+                loss_t2s = InfoNCE_loss(feature_t, feature_s, gt_pairs=(index_t, index_s))
 
-                infor_loss_s = InfoNCE_loss(feature_s, feature_s, gt_pairs=(index_s, index_s))
-                infor_loss_t = InfoNCE_loss(feature_t, feature_t, gt_pairs=(index_t, index_t))
-
-                only_negative_weight = 0.5
-                total_loss = infor_loss + (only_negative_weight*infor_loss_s + only_negative_weight*infor_loss_t)/2
-
-
+                loss = (loss_s2t + loss_t2s) / 2
+                reg = (feature_s.std() + feature_t.std())
+                loss = loss - 0.01 * reg
 
                 self.optimizer.zero_grad()
-                total_loss.backward()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.models.parameters(), 5.0)
                 self.optimizer.step()
 
-                infor_loss_train = torch.cat((infor_loss_train, infor_loss.detach().cpu().view(-1)))
-                # loss_m_all = torch.cat((loss_m_all, loss_np.detach().cpu().view(-1)))
-                # p_all = torch.cat((p_all, loss_p.cpu().view(-1)))
-                loss_m_all = torch.cat((loss_m_all, torch.zeros([0])))
-                p_all = torch.cat((p_all, torch.zeros([0])))
-
-                import ipdb
-                # ipdb.set_trace()
-                top1_train, top5_train = self.calculate_train_val_top_recall(feature_s.detach().cpu(), feature_t.detach().cpu())
-                top1_reacll_train = torch.cat((top1_reacll_train, top1_train))
-                top5_reacll_train = torch.cat((top5_reacll_train, top5_train))
-
+                infor_loss_train.append(loss.item())
             self.scheduler.step()
 
-            # if torch.distributed.get_rank() in [1]:
-            if True:
-                self.writer.add_scalar('train_loss', loss_m_all.mean(), i)
-                self.writer.add_scalar('Stage2_Infor_loss_train', infor_loss_train.mean(), i)
-
-                self.writer.add_scalar('top1_reacll_train', top1_reacll_train.mean(), i)
-                self.writer.add_scalar('top5_reacll_train', top5_reacll_train.mean(), i)
-
-
-            if (i + 1) % 2 != 0:
-                continue
             '''validation'''
             self.models.eval()
-            self.models.requires_grad_(False)
-            for batch, (stage1_features) in enumerate(tqdm(self.val_loader)):
-                all_data, mask_para = stage1_features
-                stage1_features_s, stage1_features_t, index_s, index_t, pcd_s, pcd_t = all_data
-                stage1_features_s, stage1_features_t, pcd_s, pcd_t = stage1_features_s.to(self.device), stage1_features_t.to(self.device), pcd_s.to(self.device), pcd_t.to(self.device)
-                
+            with torch.no_grad():
 
+                for _, (stage1_features) in enumerate(tqdm(self.val_loader)):
 
-                feature_s, _ = self.models(stage1_features_s, pcd_s)
-                feature_t, _ = self.models(stage1_features_t, pcd_t)
+                    all_data, mask_para = stage1_features
+                    stage1_features_s, stage1_features_t, index_s, index_t, pcd_s, pcd_t = all_data
 
-                '''searching loss'''
-                InfoNCE_loss = InfoNCE(temperature=self.contrast_temperature)
-                infor_loss = InfoNCE_loss(feature_s, feature_t, gt_pairs=(index_s, index_t))
+                    stage1_features_s = stage1_features_s.to(self.device)
+                    stage1_features_t = stage1_features_t.to(self.device)
+                    pcd_s = pcd_s.to(self.device)
+                    pcd_t = pcd_t.to(self.device)
 
-                v_loss_np_all = torch.cat((v_loss_np_all, torch.zeros([0])))
-                v_p_all = torch.cat((v_p_all,torch.zeros([0])))
-                
+                    feature_s, _ = self.models(stage1_features_s, pcd_s)
+                    feature_t, _ = self.models(stage1_features_t, pcd_t)
+                    feature_s = F.normalize(feature_s, p=2, dim=1)
+                    feature_t = F.normalize(feature_t, p=2, dim=1)
+                    val_loss = InfoNCE_loss(feature_s.detach(), feature_t.detach(), gt_pairs=(index_s, index_t))
 
-                infor_loss_val = torch.cat((infor_loss_val, infor_loss.detach().cpu().view(-1)))
-
-                top1_val, top5_val = self.calculate_train_val_top_recall(feature_s.detach().cpu(), feature_t.detach().cpu())
-                top1_reacll_val = torch.cat((top1_reacll_val, top1_val))
-                top5_reacll_val = torch.cat((top5_reacll_val, top5_val))
+                    infor_loss_val.append(val_loss.item())
             
-            
-            # if torch.distributed.get_rank() in [1]:
-            if True:
+            # ===== log =====
+            train_loss=np.mean(infor_loss_train)
+            val_loss=np.mean(infor_loss_val)
 
-                self.writer.add_scalar('top1_reacll_val', top1_reacll_val.mean(), i)
-                self.writer.add_scalar('top5_reacll_val', top5_reacll_val.mean(), i)
+            self.writer.add_scalar('train_loss', train_loss, i)
+            self.writer.add_scalar('val_loss', val_loss, i)
 
-                self.writer.add_scalar('StageTwo_infor_loss_val', infor_loss_val.mean(), i)
-                self.writer.add_scalar('valid_loss', v_loss_np_all.mean(), i)
-                self.writer.add_scalar('valid_positive_loss', v_p_all.mean(), i)
-                means_all = infor_loss_val.mean()
+            # ===== save checkpoint =====
+            self.save_checkpoint(i, val_loss)
 
-                if means_all < min_loss:
-                    self.save_checkpoint(i)
-
-                print("loacl rank = {}".format(0))
-                print("epoch = {}".format(i))
-                print('epoch = {}, match_loss = {}, loss_p = {}, v_match_loss = {}, v_loss_p = {}'.format(
-                    i, loss_m_all.mean(), p_all.mean(), v_loss_np_all.mean(), v_p_all.mean(),
-                ))
-                print('\n')
-                print("stage2_infor_loss_val =  {}".format(infor_loss_val.mean()))
-                print("top1_reacll_val =  {}".format(top1_reacll_val.mean()))
-                print("top5_reacll_val =  {}".format(top5_reacll_val.mean()))
+            print(f"epoch={i}, train_loss={train_loss:.4f}, val_loss={val_loss:.4f}")
 
 
 class ST2_SearchModel(object):
@@ -986,17 +1001,22 @@ class ST2_SearchModel(object):
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.case_name = case_name
         self.checkpoint_path = EXP_path+'/EXP2/{}/checkpoint'.format(case_name)
-        self.saved_test_feature_path = args.stage2_feature_path+'/{}/test_feature_{}.pkl'.format(case_name, args.dataset_select)
+        base = os.path.join(args.stage2_feature_path, case_name)
+        self.saved_test_feature_path = self.find_feature(base,"test_feature_*.pkl")
         self.test_data, self.Stage1_data = self.set_dataset_searching(self.saved_test_feature_path, args)
         self.test_loader = DataLoader(self.test_data, 1, num_workers=0, shuffle=False)
         self.models = net(args)
         self.models.to(self.device)
         self.models.eval()
         self.models.requires_grad_(False)
-        self.feature_all_flatten = torch.zeros((0, args.global_out_channels))
         self.max_point = args.max_length
         self.global_out_channels = args.global_out_channels
 
+
+    def find_feature(self,path,pattern):
+        files=glob(os.path.join(path,pattern))
+        assert len(files)>0
+        return sorted(files)[-1]
 
     def get_max_file_number(self, directory):
         max_number = -1
@@ -1012,13 +1032,14 @@ class ST2_SearchModel(object):
         return max_file
     
     def set_dataset_searching(self, data_path, args):
-        with open(data_path, 'rb') as feature_file:
-            stage1_features = pickle.load(feature_file)
+        with open(data_path, 'rb') as f:
+            stage1_features = pickle.load(f)
+
         dataset = data_preprocess.MyDataSet_searching(stage1_features, args)
         return dataset, stage1_features
 
     def load_checkpoint_evl(self, checkpoint_path_evl):
-        checkpoint = torch.load(checkpoint_path_evl)
+        checkpoint = torch.load(checkpoint_path_evl,map_location=self.device)
         self.models.load_state_dict(checkpoint['model_state_dict'])
         return
 
@@ -1026,7 +1047,7 @@ class ST2_SearchModel(object):
         """to get the topk searching result from score matrix"""
         sort_matrix = torch.sort(result_matrix, dim=-1, descending=True)
         idx = sort_matrix[1]
-        idx = idx.numpy() 
+        idx=idx.cpu().numpy()
         l = []
         for i in range(len(gt_pair)):
             l.append(np.argwhere(idx[gt_pair[i][0]] == gt_pair[i][1]))
@@ -1052,7 +1073,7 @@ class ST2_SearchModel(object):
     
     
     def searching_start(self):
-        best_checkpoint = self.get_max_file_number(self.checkpoint_path)
+        best_checkpoint = "best.tar"
         print("best_checkpoint:{}".format(best_checkpoint))
 
         checkpoint_path_evl = EXP_path+'/EXP2/{}/checkpoint/{}'.format(self.case_name, best_checkpoint)
@@ -1062,48 +1083,51 @@ class ST2_SearchModel(object):
         if os.path.exists(self.stage2_result_path) is False:
             os.mkdir(self.stage2_result_path)
         
-        import time
         start_time = time.time()
         saved_test_weight = []
-        for batch, (stage1_features) in enumerate(tqdm(self.test_loader)):
-            stage1_features, pcd = stage1_features
-            stage1_features, pcd = stage1_features.to(self.device), pcd.to(self.device)
-            
-            F_global, w_ = self.models(stage1_features, pcd)
+        print("searching start!")
+        features_all = []
+        self.models.eval()
+        with torch.no_grad():
 
-            self.feature_all_flatten = torch.cat((self.feature_all_flatten, F_global.cpu()), dim=0)
+            for i in tqdm(range(len(self.test_data.stage1_feature))):
+                feat=self.test_data.stage1_feature[i].unsqueeze(0).to(self.device)
+                pcd=self.test_data.full_pcd_all[i].unsqueeze(0).to(self.device)
+                F_s,w_s=self.models(feat,pcd)
+                F_s=F.normalize(F_s,dim=1)
+                features_all.append(F_s.cpu())
+                saved_test_weight.append(w_s.cpu())
 
-            w = w_.clone().detach()
-            w = w.cpu().numpy()
-            saved_test_weight.append(w)
-
-        F_normalized = F.normalize(self.feature_all_flatten, p=2, dim=1)
+        features_all = torch.cat(features_all, dim=0)
+        F_normalized = F.normalize(features_all, p=2, dim=1)
 
         cos_sim_matrix = torch.matmul(F_normalized, F_normalized.T)
         cos_sim_matrix.fill_diagonal_(-1)
-        result = self.feature_searching(cos_sim_matrix, self.Stage1_data['GT_pairs'])
-        print(result)
+        gt_pairs = np.array(self.test_data.GT_pairs)
+
+        result = self.feature_searching(cos_sim_matrix, gt_pairs)
+        print("Result:", result)
         end_time = time.time()
-        run_time = (end_time - start_time)
-        print("Runtime：", run_time, "s")
-
-
-
+        print("Runtime:", end_time - start_time, "s")
+        print("feature std:", features_all.std().item())
+        print("feature mean:", features_all.mean().item())
         saved_matrix = {
             "matrix": cos_sim_matrix.data.cpu().numpy(),
-            "GT_pairs": self.Stage1_data['GT_pairs']
+            "GT_pairs": self.test_data.GT_pairs
         }
-
+        saved_feature={
+            "feature":features_all.numpy()
+        }
 
         with open(self.stage2_result_path+'/sim_matrix_390_stage2_self_gate.pkl', 'wb') as f:
             pickle.dump(saved_matrix, f)
         with open(self.stage2_result_path+'/global_feature_390_stage2_self_gate.pkl', 'wb') as f:
-            pickle.dump(saved_matrix, f)
+            pickle.dump(saved_feature, f)
         searching_recall = result
         with open(self.stage2_result_path+'/searching recall.txt', 'w') as f:
             f.write('{}'.format(searching_recall))
         
-        with open(self.stage2_result_path+'/saved_test_weight_390_stage2.pkl'.format(self.case_name), 'wb') as file:
+        with open(self.stage2_result_path+'/saved_test_weight_390_stage2.pkl', 'wb') as file:
             pickle.dump(saved_test_weight, file)
 
 
@@ -1242,12 +1266,10 @@ class Real_TestModel(Train_model):
         self.load_checkpoint_evl()
         gt_pairs = self.gt_pairs
         device = self.device
-        global c
         valid_nums4 = 0  # count the good registration nums
         valid_nums2 = 0
         valid_nums6 = 0
         c = 0  # count the fragment nums
-        w_min = 100
         w_count = 0
         haus_list = []  # list of mean hausdroff distance of each gt pair
 
@@ -1260,7 +1282,7 @@ class Real_TestModel(Train_model):
         saved_test_weight = []
         for batch, (mask_para, imgs, pcd, c_input, t_input, adjs, factors) in enumerate(tqdm(self.test_loader)):
 
-            max_point_nums = len(pcd[0][0])
+            max_point_nums = pcd[0].shape[1]
             adj_s = self.get_concat_adj(adjs[0], max_point_nums)
             adj_t = self.get_concat_adj(adjs[1], max_point_nums)
 
@@ -1417,7 +1439,7 @@ class STAGE_ONE_REAL(Train_model):
             }
 
             matching_feature, feature, _ = self.models(inputs) # bs,2611,64
-            train_saved_feature["saved_feature"].append(feature.squeeze().cpu())
+            train_saved_feature["saved_feature"].append(feature.detach().cpu())
             
         
         with open(self.saved_train_feature_path, 'wb') as file:

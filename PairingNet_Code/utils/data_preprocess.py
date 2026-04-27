@@ -87,17 +87,6 @@ class MyDataSet(Dataset):
         max_points = args.max_length
         self.max_points = max_points
 
-        self.mask_all = torch.zeros(
-            (len(self.GT_pairs), self.max_points, self.max_points),
-            dtype=torch.bool
-        )
-
-        self.adj_all = [self.get_adj(i) for i in range(len(self.raw_img))]
-
-        for i in range(len(self.GT_pairs)):
-            s = GT_config['source_ind'][i]
-            t = GT_config['target_ind'][i]
-            self.mask_all[i][s, t] = True
         n = len(self.raw_img)
     
         c = GT_config['channel']
@@ -181,8 +170,8 @@ class MyDataSet(Dataset):
             # print("img_t tensor:", img_t.shape, img_t.element_size() * img_t.nelement() / 1024**2, "MB")
 
             # ---- adjacency (lazy) ----
-            adj_s = self.adj_all[idx_s]
-            adj_t = self.adj_all[idx_t]
+            adj_s=self.get_adj(idx_s)
+            adj_t=self.get_adj(idx_t)
 
             c_s = torch.zeros((self.max_points, self.patch_size, self.patch_size))
             c_t = torch.zeros((self.max_points, self.patch_size, self.patch_size))
@@ -268,13 +257,17 @@ class MyDataSet_searching(Dataset):
         # =========================
         self.stage1_feature = []
         self.full_pcd = []
-        for i in range(len(raw_feat)):
-            if raw_feat[i] is None or raw_pcd[i] is None:
+        old_to_new = {}
+        for old_i in range(len(raw_feat)):
+            if raw_feat[old_i] is None or raw_pcd[old_i] is None:
                 continue
-            self.stage1_feature.append(raw_feat[i])
-            self.full_pcd.append(raw_pcd[i])
+            
+            new_i = len(self.stage1_feature)
+            self.stage1_feature.append(raw_feat[old_i])
+            self.full_pcd.append(raw_pcd[old_i])
+            old_to_new[old_i] = new_i
 
-        print(f"✅ valid samples: {len(self.stage1_feature)}")
+        print(f"valid samples: {len(self.stage1_feature)}")
         n = len(self.full_pcd)
         # =========================
         # 2. padding point cloud
@@ -289,12 +282,16 @@ class MyDataSet_searching(Dataset):
         # 3. 重新构建 GT_pairs（防越界）
         # =========================
         self.GT_pairs = []
-
         for s, t in raw_pairs:
-            if s < n and t < n:
-                self.GT_pairs.append((s, t))
+            if s in old_to_new and t in old_to_new:
+                self.GT_pairs.append((
+                    old_to_new[s],
+                    old_to_new[t]
+                ))
 
         print(f"✅ valid pairs: {len(self.GT_pairs)}")
+        print("raw pairs:", len(raw_pairs))
+        print("coverage:", len(self.GT_pairs)/len(raw_pairs))
     
     def __len__(self):
         return len(self.GT_pairs)
@@ -326,7 +323,7 @@ class MyDataSet_searching(Dataset):
         )
 
         # =========================
-        # ② mask_para（训练用辅助信息）
+        # ② mask_para
         # =========================
         mask_para = (self.full_pcd[s].shape[0], self.full_pcd[t].shape[0])
 
